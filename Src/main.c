@@ -1529,7 +1529,7 @@ void tenKhzRoutine()
                             governor_rpm_target = (governor_rpm_target > step) ? (governor_rpm_target - step) : desired_rpm;
                         }
                     }
-                    target_e_com_time = (uint16_t)rpm_governor_calc_com_time(governor_rpm_target, eepromBuffer.motor_poles);
+                    target_e_com_time = rpm_governor_calc_com_time_u16(governor_rpm_target, eepromBuffer.motor_poles);
                 }
                 // DC-bus hard ceiling 28A: shed 1 dshot count per ms instead of PID gain
                 if (target_e_com_time != 0 &&

@@ -40,6 +40,14 @@ uint32_t rpm_governor_calc_com_time(uint32_t target_rpm, uint8_t poles) {
     return 60000000UL / target_rpm / (poles / 2);
 }
 
+uint16_t rpm_governor_calc_com_time_u16(uint32_t target_rpm, uint8_t poles) {
+    uint32_t com_time = rpm_governor_calc_com_time(target_rpm, poles);
+    if (com_time > UINT16_MAX) {
+        return UINT16_MAX;
+    }
+    return (uint16_t)com_time;
+}
+
 bool rpm_governor_check_current_trip(uint16_t actual_current_cA, uint16_t max_current_cA) {
     return (actual_current_cA >= max_current_cA);
 }
