@@ -221,6 +221,7 @@ an settings option)
 #include "common.h"
 #include "comparator.h"
 #include "dshot.h"
+#include "rpm_governor.h"
 #include "eeprom.h"
 #include "functions.h"
 #include "peripherals.h"
@@ -602,6 +603,41 @@ int32_t doPidCalculations(struct fastPID* pidnow, int actual, int target)
     return pidnow->pid_output;
 }
 
+// CT-UAV RPM governor state (EEPROM v5 block at bytes 184-191)
+uint8_t governor_enabled = 0;
+uint32_t governor_rpm_min = 1000;
+uint32_t governor_rpm_max = 9000;
+uint32_t governor_rpm_target = 0;
+uint8_t governor_slew_div_250 = 0;
+
+static void applyGovernorConfig(void)
+{
+    governor_enabled = 0;
+    // ponytail: governor requires forward-only DShot; sine-start/stall/BI must be off.
+    // Upgrade path: lift restriction after bench validation of sine/governor handover.
+    if (eepromBuffer.bi_direction || eepromBuffer.use_sine_start || eepromBuffer.stall_protection) {
+        return;
+    }
+    if (!rpm_governor_validate_config((const uint8_t *)&eepromBuffer.governor)) {
+        return; // invalid CRC -> governor silently OFF (stock AM32 behavior preserved)
+    }
+    if ((eepromBuffer.governor.rpm_mode_and_min & 0x80) == 0) {
+        return;
+    }
+    uint8_t mn = eepromBuffer.governor.rpm_mode_and_min & 0x7F;
+    uint8_t mx = eepromBuffer.governor.rpm_max_div_100;
+    if (mn < 10 || mn > 90 || mx < 10 || mx > 90 || mx <= mn) {
+        return;
+    }
+    governor_rpm_min = (uint32_t)mn * 100u;
+    governor_rpm_max = (uint32_t)mx * 100u;
+    speedPid.Kp = eepromBuffer.governor.kp_raw;
+    speedPid.Ki = eepromBuffer.governor.ki_raw;
+    speedPid.Kd = 0; // PI only
+    governor_slew_div_250 = eepromBuffer.governor.slew_div_250;
+    governor_enabled = 1;
+}
+
 void loadEEpromSettings()
 {
     read_flash_bin(eepromBuffer.buffer, eeprom_address, sizeof(eepromBuffer.buffer));
@@ -799,6 +835,7 @@ void loadEEpromSettings()
       polling_mode_changeover = POLLING_MODE_THRESHOLD;
     }
     temp_comp_pwm = eepromBuffer.comp_pwm;
+    applyGovernorConfig();
 }
 
 void saveEEpromSettings()
@@ -1156,7 +1193,23 @@ void setInput()
             }
         } else {
             if (use_speed_control_loop) {
-                if (drive_by_rpm) {
+                if (governor_enabled && dshot) {
+                    if (newinput < 48) { // dead band ?
+                        input = 0;
+                        speedPid.error = 0;
+                        input_override = 0;
+                        governor_rpm_target = 0;
+                        target_e_com_time = 0;
+                    } else {
+                        input = (uint16_t)(input_override / 10000); // speed control pid override
+                        if (input > 2047) {
+                            input = 2047;
+                        }
+                        if (input < 48) {
+                            input = 48;
+                        }
+                    }
+                } else if (drive_by_rpm) {
                     target_e_com_time = 60000000 / map(adjusted_input, 47, 2047, MINIMUM_RPM_SPEED_CONTROL, MAXIMUM_RPM_SPEED_CONTROL) / (eepromBuffer.motor_poles / 2);
                     if (adjusted_input < 47) { // dead band ?
                         input = 0;
@@ -1450,7 +1503,54 @@ void tenKhzRoutine()
                     stall_protection_adjust = 0;
                 }
             }
-            if (use_speed_control_loop && running) {
+            if (governor_enabled && dshot && running) {
+                // CT-UAV RPM governor: map DShot -> mech RPM target, slew-limit, hold comm time
+                uint32_t desired_rpm = rpm_governor_map_dshot(newinput, governor_rpm_min, governor_rpm_max);
+                if (desired_rpm == 0) {
+                    input_override = 0;
+                    speedPid.error = 0;
+                    speedPid.integral = 0;
+                    governor_rpm_target = 0;
+                    target_e_com_time = 0;
+                } else {
+                    if (governor_slew_div_250 == 0) {
+                        governor_rpm_target = desired_rpm;
+                    } else {
+                        uint32_t step = ((uint32_t)governor_slew_div_250 * 250u) / 1000u; // rpm per 1ms tick
+                        if (step == 0) {
+                            step = 1;
+                        }
+                        if (governor_rpm_target < desired_rpm) {
+                            governor_rpm_target += step;
+                            if (governor_rpm_target > desired_rpm) {
+                                governor_rpm_target = desired_rpm;
+                            }
+                        } else if (governor_rpm_target > desired_rpm) {
+                            governor_rpm_target = (governor_rpm_target > step) ? (governor_rpm_target - step) : desired_rpm;
+                        }
+                    }
+                    target_e_com_time = (uint16_t)rpm_governor_calc_com_time(governor_rpm_target, eepromBuffer.motor_poles);
+                }
+                // DC-bus hard ceiling 28A: shed 1 dshot count per ms instead of PID gain
+                if (target_e_com_time != 0 &&
+                    rpm_governor_check_current_trip((uint16_t)actual_current, DC_BUS_CURRENT_TRIP_CA)) {
+                    input_override -= 10000;
+                    if (input_override < 0) {
+                        input_override = 0;
+                    }
+                } else {
+                    input_override += doPidCalculations(&speedPid, e_com_time, target_e_com_time);
+                }
+                if (input_override > 2047 * 10000) {
+                    input_override = 2047 * 10000;
+                }
+                if (input_override < 0) {
+                    input_override = 0;
+                }
+                if (zero_crosses < 100) {
+                    speedPid.integral = 0;
+                }
+            } else if (use_speed_control_loop && running) {
                 input_override += doPidCalculations(&speedPid, e_com_time, target_e_com_time);
                 if (input_override > 2047 * 10000) {
                     input_override = 2047 * 10000;
@@ -1894,6 +1994,9 @@ int main(void)
     // checkForHighSignal();     // will reboot if signal line is high for 10ms
     receiveDshotDma();
     if (drive_by_rpm) {
+        use_speed_control_loop = 1;
+    }
+    if (governor_enabled) {
         use_speed_control_loop = 1;
     }
 #endif

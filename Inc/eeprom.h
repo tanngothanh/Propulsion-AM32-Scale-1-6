@@ -69,7 +69,16 @@ typedef union EEprom_u {
             uint8_t filter_hz; // 181
             uint8_t debug_rate; // 182
             uint8_t term_enable; // 183
-            uint8_t reserved[8]; // 184-191
+            struct { // CT-UAV RPM governor extension (EEPROM v5), bytes 184-191
+                uint8_t rpm_mode_and_min; // bit7: enable, bits0-6: RPM_MIN/100 (10..90)
+                uint8_t rpm_max_div_100;  // RPM_MAX/100 (10..90)
+                uint8_t kp_raw;           // speed PID Kp (AM32 x10000 scale, default 10)
+                uint8_t ki_raw;           // speed PID Ki
+                uint8_t slew_div_250;     // slew: RPM step = raw*250/1000 per 1ms tick, 0=unlimited
+                uint8_t delta_v_div_0_1;  // reserved voltage feed-forward (0.1 V units)
+                uint8_t erpm_loss_ms;     // reserved eRPM loss timeout (ms)
+                uint8_t crc8_atm;         // CRC-8/ATM over bytes 184..190
+            } governor;
         } can;
     };
     uint8_t buffer[192];
