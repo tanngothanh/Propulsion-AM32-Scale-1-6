@@ -24,9 +24,9 @@ typedef struct {
 } __attribute__((packed)) rpm_governor_config_block_t;
 
 typedef struct {
-    uint32_t last_zero_crosses;
-    uint16_t loss_timer_ms;
-    uint8_t latched_fault;
+    volatile uint32_t last_zero_crosses;
+    volatile uint16_t loss_timer_ms;
+    volatile uint8_t latched_fault;
 } rpm_governor_failsafe_state_t;
 
 uint8_t rpm_governor_calc_crc8_atm(const uint8_t *data, uint8_t len);
