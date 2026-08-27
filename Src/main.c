@@ -618,23 +618,23 @@ static void applyGovernorConfig(void)
     if (eepromBuffer.bi_direction || eepromBuffer.use_sine_start || eepromBuffer.stall_protection) {
         return;
     }
-    if (!rpm_governor_validate_config((const uint8_t *)&eepromBuffer.governor)) {
+    if (!rpm_governor_validate_config((const uint8_t *)&eepromBuffer.can.governor)) {
         return; // invalid CRC -> governor silently OFF (stock AM32 behavior preserved)
     }
-    if ((eepromBuffer.governor.rpm_mode_and_min & 0x80) == 0) {
+    if ((eepromBuffer.can.governor.rpm_mode_and_min & 0x80) == 0) {
         return;
     }
-    uint8_t mn = eepromBuffer.governor.rpm_mode_and_min & 0x7F;
-    uint8_t mx = eepromBuffer.governor.rpm_max_div_100;
+    uint8_t mn = eepromBuffer.can.governor.rpm_mode_and_min & 0x7F;
+    uint8_t mx = eepromBuffer.can.governor.rpm_max_div_100;
     if (mn < 10 || mn > 90 || mx < 10 || mx > 90 || mx <= mn) {
         return;
     }
     governor_rpm_min = (uint32_t)mn * 100u;
     governor_rpm_max = (uint32_t)mx * 100u;
-    speedPid.Kp = eepromBuffer.governor.kp_raw;
-    speedPid.Ki = eepromBuffer.governor.ki_raw;
+    speedPid.Kp = eepromBuffer.can.governor.kp_raw;
+    speedPid.Ki = eepromBuffer.can.governor.ki_raw;
     speedPid.Kd = 0; // PI only
-    governor_slew_div_250 = eepromBuffer.governor.slew_div_250;
+    governor_slew_div_250 = eepromBuffer.can.governor.slew_div_250;
     governor_enabled = 1;
 }
 
