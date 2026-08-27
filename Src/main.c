@@ -609,10 +609,14 @@ uint32_t governor_rpm_min = 1000;
 uint32_t governor_rpm_max = 9000;
 uint32_t governor_rpm_target = 0;
 uint8_t governor_slew_div_250 = 0;
+uint8_t governor_erpm_loss_ms = 0;
+rpm_governor_failsafe_state_t governor_failsafe = {0, 0, 0};
 
 static void applyGovernorConfig(void)
 {
     governor_enabled = 0;
+    governor_erpm_loss_ms = 0;
+    rpm_governor_failsafe_reset(&governor_failsafe, zero_crosses);
     // ponytail: governor requires forward-only DShot; sine-start/stall/BI must be off.
     // Upgrade path: lift restriction after bench validation of sine/governor handover.
     if (eepromBuffer.bi_direction || eepromBuffer.use_sine_start || eepromBuffer.stall_protection) {
@@ -635,6 +639,7 @@ static void applyGovernorConfig(void)
     speedPid.Ki = eepromBuffer.can.governor.ki_raw;
     speedPid.Kd = 0; // PI only
     governor_slew_div_250 = eepromBuffer.can.governor.slew_div_250;
+    governor_erpm_loss_ms = eepromBuffer.can.governor.erpm_loss_ms;
     governor_enabled = 1;
 }
 
@@ -1194,7 +1199,7 @@ void setInput()
         } else {
             if (use_speed_control_loop) {
                 if (governor_enabled && dshot) {
-                    if (newinput < 48) { // dead band ?
+                    if (newinput < 48 || governor_failsafe.latched_fault) { // dead band or feedback loss trip?
                         input = 0;
                         speedPid.error = 0;
                         input_override = 0;
@@ -1546,6 +1551,13 @@ void tenKhzRoutine()
                 }
                 if (input_override < 0) {
                     input_override = 0;
+                }
+                if (rpm_governor_failsafe_update(&governor_failsafe, zero_crosses, newinput, governor_erpm_loss_ms, governor_enabled, running)) {
+                    input_override = 0;
+                    speedPid.error = 0;
+                    speedPid.integral = 0;
+                    governor_rpm_target = 0;
+                    target_e_com_time = 0;
                 }
                 if (zero_crosses < 100) {
                     speedPid.integral = 0;

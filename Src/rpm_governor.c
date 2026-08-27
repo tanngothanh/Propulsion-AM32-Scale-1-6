@@ -51,3 +51,53 @@ uint16_t rpm_governor_calc_com_time_u16(uint32_t target_rpm, uint8_t poles) {
 bool rpm_governor_check_current_trip(uint16_t actual_current_cA, uint16_t max_current_cA) {
     return (actual_current_cA >= max_current_cA);
 }
+
+void rpm_governor_failsafe_reset(rpm_governor_failsafe_state_t *state, uint32_t current_zc) {
+    if (!state) {
+        return;
+    }
+    state->last_zero_crosses = current_zc;
+    state->loss_timer_ms = 0;
+    state->latched_fault = 0;
+}
+
+bool rpm_governor_failsafe_update(
+    rpm_governor_failsafe_state_t *state,
+    uint32_t current_zc,
+    uint16_t dshot_cmd,
+    uint8_t timeout_ms,
+    bool governor_active,
+    bool running
+) {
+    if (!state) {
+        return false;
+    }
+    if (dshot_cmd < DSHOT_MIN_THROTTLE) {
+        state->latched_fault = 0;
+        state->loss_timer_ms = 0;
+        state->last_zero_crosses = current_zc;
+        return false;
+    }
+    if (state->latched_fault) {
+        state->last_zero_crosses = current_zc;
+        return true;
+    }
+    if (!governor_active || !running || timeout_ms == 0) {
+        state->loss_timer_ms = 0;
+        state->last_zero_crosses = current_zc;
+        return false;
+    }
+    if (current_zc != state->last_zero_crosses) {
+        state->last_zero_crosses = current_zc;
+        state->loss_timer_ms = 0;
+        return false;
+    }
+    if (state->loss_timer_ms < UINT16_MAX) {
+        state->loss_timer_ms++;
+    }
+    if (state->loss_timer_ms >= (uint16_t)timeout_ms) {
+        state->latched_fault = 1;
+        return true;
+    }
+    return false;
+}
