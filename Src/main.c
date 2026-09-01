@@ -1231,10 +1231,13 @@ void setInput()
                     uint32_t r_max = governor_enabled ? governor_rpm_max : MAXIMUM_RPM_SPEED_CONTROL;
                     uint32_t r_min_sq = r_min * r_min;
                     uint32_t r_max_sq = r_max * r_max;
-                    uint32_t throttle_range = 2000; // 2047 - 47
+                    uint32_t throttle_range = 2000;
                     uint32_t throttle_in = (adjusted_input > 47) ? (uint32_t)(adjusted_input - 47) : 0;
                     if (throttle_in > throttle_range) throttle_in = throttle_range;
-                    uint32_t rpm_sq = r_min_sq + (uint32_t)(((uint64_t)throttle_in * (r_max_sq - r_min_sq)) / throttle_range);
+
+                    // Pure 32-bit integer arithmetic (0 software division routine calls)
+                    uint32_t rpm_slope = (r_max_sq - r_min_sq) / throttle_range;
+                    uint32_t rpm_sq = r_min_sq + (throttle_in * rpm_slope);
                     uint32_t target_rpm_val = fast_int_sqrt32(rpm_sq);
 
                     target_e_com_time = 60000000UL / target_rpm_val / (eepromBuffer.motor_poles / 2);
