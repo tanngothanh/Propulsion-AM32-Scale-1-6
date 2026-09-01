@@ -1243,10 +1243,11 @@ void setInput()
                             }
                             // Feedforward base + accumulated PID correction
                             int32_t ff_override = ff_input * 10000;
+                            uint32_t primask = __get_PRIMASK();
                             __disable_irq();
                             int32_t pid_correction = input_override - last_ff_override;
                             input_override = ff_override + pid_correction;
-                            __enable_irq();
+                            __set_PRIMASK(primask);
                             last_ff_override = ff_override;
 
                             input = (uint16_t)(input_override / 10000);
@@ -2308,8 +2309,8 @@ if(zero_crosses < 5){
             }else{
 							duty_cycle_maximum = 2000;
 						}
-            // Governor mode: disable duty cap when motor is running and governor active
-            if (governor_enabled && drive_by_rpm && running) {
+            // Governor mode: disable duty cap when governor active
+            if (governor_enabled && drive_by_rpm) {
                 duty_cycle_maximum = 2000;
             }
 
