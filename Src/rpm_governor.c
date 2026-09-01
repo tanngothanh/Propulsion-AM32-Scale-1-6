@@ -33,6 +33,7 @@ uint32_t rpm_governor_map_dshot(uint16_t dshot_val, uint32_t rpm_min, uint32_t r
     return rpm_min + ((uint32_t)(dshot_val - DSHOT_MIN_THROTTLE) * (rpm_max - rpm_min) + 999u) / 1999u;
 }
 
+__attribute__((noinline, used))
 uint32_t rpm_governor_calc_com_time(uint32_t target_rpm, uint8_t poles) {
     if (target_rpm == 0 || poles < 2) {
         return 0;
