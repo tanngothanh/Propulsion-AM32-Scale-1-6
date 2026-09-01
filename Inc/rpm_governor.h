@@ -31,19 +31,7 @@ typedef struct {
 
 uint8_t rpm_governor_calc_crc8_atm(const uint8_t *data, uint8_t len);
 bool rpm_governor_validate_config(const uint8_t *block);
-uint32_t rpm_governor_map_dshot(uint16_t dshot_val, uint32_t rpm_min, uint32_t rpm_max);
-uint32_t rpm_governor_calc_com_time(uint32_t target_rpm, uint8_t poles);
-uint16_t rpm_governor_calc_com_time_u16(uint32_t target_rpm, uint8_t poles);
-bool rpm_governor_check_current_trip(uint16_t actual_current_cA, uint16_t max_current_cA);
 void rpm_governor_failsafe_reset(rpm_governor_failsafe_state_t *state, uint32_t current_zc);
-bool rpm_governor_failsafe_update(
-    rpm_governor_failsafe_state_t *state,
-    uint32_t current_zc,
-    uint16_t dshot_cmd,
-    uint8_t timeout_ms,
-    bool governor_active,
-    bool running
-);
 
 #ifdef __cplusplus
 }

@@ -611,6 +611,7 @@ uint32_t governor_rpm_target = 0;
 uint8_t governor_slew_div_250 = 0;
 uint8_t governor_erpm_loss_ms = 0;
 rpm_governor_failsafe_state_t governor_failsafe = {0, 0, 0};
+static int32_t last_ff_override = 0;
 
 static void applyGovernorConfig(void)
 {
@@ -635,15 +636,21 @@ static void applyGovernorConfig(void)
     }
     governor_rpm_min = (uint32_t)mn * 100u;
     governor_rpm_max = (uint32_t)mx * 100u;
-    speedPid.Kp = (uint32_t)eepromBuffer.can.governor.kp_raw * 40u;  // acts as I-gain in velocity form
-    speedPid.Ki = 0;   // MUST be 0: input_override += already integrates, Ki would double-integrate
-    speedPid.Kd = (uint32_t)eepromBuffer.can.governor.ki_raw * 40u;  // acts as P-gain in velocity form
-    speedPid.integral_limit = 20470000;  // full DShot range (2047 * 10000)
-    speedPid.output_limit   = 50000;     // ~5 DShot counts/tick (500ms to full throttle)
+    speedPid.Kp = 80;       // integral: low (steady-state correction only)
+    speedPid.Ki = 0;
+    speedPid.Kd = 1500;     // aggressive damping: boosts duty during accel, brakes during decel
+    speedPid.integral_limit = 20470000;
+    speedPid.output_limit   = 30000;  // allow PID to boost above FF during transients
     governor_slew_div_250 = eepromBuffer.can.governor.slew_div_250;
     governor_erpm_loss_ms = eepromBuffer.can.governor.erpm_loss_ms;
     governor_enabled = 1;
-    use_speed_control_loop = 1;
+    drive_by_rpm = 1;
+    // low_rpm_throttle_limit handled at runtime in tenKhzRoutine when governor running
+    // Governor needs fast duty changes for feedforward step response
+    // Stock ramp is ~10/tick (protection for open-loop). Governor is closed-loop,
+    // so fast ramp is safe — PID prevents desync.
+    max_ramp_low_rpm = 100;
+    max_ramp_high_rpm = 100;
 }
 
 void loadEEpromSettings()
@@ -1201,35 +1208,50 @@ void setInput()
             }
         } else {
             if (use_speed_control_loop) {
-                if (governor_enabled && dshot) {
-                    if (newinput < 48 || governor_failsafe.latched_fault) { // dead band or feedback loss trip?
-                        input = 0;
-                        speedPid.error = 0;
-                        input_override = 0;
-                        governor_rpm_target = 0;
-                        target_e_com_time = 0;
-                    } else {
-                        input = (uint16_t)(input_override / 10000); // speed control pid override
-                        if (input > 2047) {
-                            input = 2047;
-                        }
-                        if (input < 48) {
-                            input = 48;
-                        }
-                    }
-                } else if (drive_by_rpm) {
-                    target_e_com_time = 60000000 / map(adjusted_input, 47, 2047, MINIMUM_RPM_SPEED_CONTROL, MAXIMUM_RPM_SPEED_CONTROL) / (eepromBuffer.motor_poles / 2);
-                    if (adjusted_input < 47) { // dead band ?
+                if (drive_by_rpm) {
+                    target_e_com_time = 60000000 / map(adjusted_input, 47, 2047,
+                        governor_enabled ? governor_rpm_min : MINIMUM_RPM_SPEED_CONTROL,
+                        governor_enabled ? governor_rpm_max : MAXIMUM_RPM_SPEED_CONTROL)
+                        / (eepromBuffer.motor_poles / 2);
+                    if (adjusted_input < 47) {
                         input = 0;
                         speedPid.error = 0;
                         input_override = 0;
                     } else {
-                        input = (uint16_t)(input_override / 10000); // speed control pid override
-                        if (input > 2047) {
-                            input = 2047;
-                        }
-                        if (input < 48) {
-                            input = 48;
+                        if (!running) {
+                            input = adjusted_input;
+                            input_override = (int32_t)adjusted_input * 10000;
+                            last_ff_override = input_override;
+                        } else {
+                            // Feedforward: calculate expected duty from motor physics
+                            // ff_duty = target_rpm * 2000 / (KV * Vbatt_volts)
+                            // battery_voltage is 10mV units, so Vbatt_volts = battery_voltage/100
+                            // ff_duty = target_rpm * 200000 / (motor_kv * battery_voltage)
+                            int32_t ff_input = 48;
+                            if (battery_voltage > 100 && motor_kv > 0) {
+                                uint32_t target_rpm_val = map(adjusted_input, 47, 2047,
+                                    governor_enabled ? governor_rpm_min : MINIMUM_RPM_SPEED_CONTROL,
+                                    governor_enabled ? governor_rpm_max : MAXIMUM_RPM_SPEED_CONTROL);
+                                uint32_t ff_duty = target_rpm_val * 200000UL
+                                                 / ((uint32_t)motor_kv * (uint32_t)battery_voltage);
+                                if (ff_duty < minimum_duty_cycle) ff_duty = minimum_duty_cycle;
+                                if (ff_duty > 2000) ff_duty = 2000;
+                                ff_input = 47 + (int32_t)(ff_duty - minimum_duty_cycle)
+                                         * 2000L / (2000 - minimum_duty_cycle);
+                                if (ff_input < 48) ff_input = 48;
+                                if (ff_input > 2047) ff_input = 2047;
+                            }
+                            // Feedforward base + accumulated PID correction
+                            int32_t ff_override = ff_input * 10000;
+                            __disable_irq();
+                            int32_t pid_correction = input_override - last_ff_override;
+                            input_override = ff_override + pid_correction;
+                            __enable_irq();
+                            last_ff_override = ff_override;
+
+                            input = (uint16_t)(input_override / 10000);
+                            if (input > 2047) input = 2047;
+                            if (input < 48) input = 48;
                         }
                     }
                 } else {
@@ -1511,69 +1533,7 @@ void tenKhzRoutine()
                     stall_protection_adjust = 0;
                 }
             }
-            if (governor_enabled && dshot && running) {
-                // CT-UAV RPM governor: map DShot -> mech RPM target, slew-limit, hold comm time
-                uint32_t desired_rpm = rpm_governor_map_dshot(newinput, governor_rpm_min, governor_rpm_max);
-                if (desired_rpm == 0) {
-                    input_override = 0;
-                    speedPid.error = 0;
-                    speedPid.integral = 0;
-                    governor_rpm_target = 0;
-                    target_e_com_time = 0;
-                } else {
-                    if (governor_slew_div_250 == 0) {
-                        governor_rpm_target = desired_rpm;
-                    } else {
-                        uint32_t step = ((uint32_t)governor_slew_div_250 * 250u) / 1000u; // rpm per 1ms tick
-                        if (step == 0) {
-                            step = 1;
-                        }
-                        if (governor_rpm_target < desired_rpm) {
-                            governor_rpm_target += step;
-                            if (governor_rpm_target > desired_rpm) {
-                                governor_rpm_target = desired_rpm;
-                            }
-                        } else if (governor_rpm_target > desired_rpm) {
-                            governor_rpm_target = (governor_rpm_target > step) ? (governor_rpm_target - step) : desired_rpm;
-                        }
-                    }
-                    target_e_com_time = rpm_governor_calc_com_time_u16(governor_rpm_target, eepromBuffer.motor_poles);
-                }
-                // DC-bus hard ceiling 28A: shed 1 dshot count per ms instead of PID gain
-                if (target_e_com_time != 0 &&
-                    rpm_governor_check_current_trip((uint16_t)actual_current, DC_BUS_CURRENT_TRIP_CA)) {
-                    input_override -= 10000;
-                    if (input_override < 0) {
-                        input_override = 0;
-                    }
-                } else {
-                    input_override += doPidCalculations(&speedPid, e_com_time, target_e_com_time);
-                }
-                if (input_override > 2047 * 10000) {
-                    input_override = 2047 * 10000;
-                }
-                if (input_override < 0) {
-                    input_override = 0;
-                }
-                uint8_t adaptive_timeout_ms = governor_erpm_loss_ms;
-                if (governor_rpm_target > 0 && adaptive_timeout_ms > 0) {
-                    uint32_t zc_period_us = 60000000UL / governor_rpm_target / (eepromBuffer.motor_poles / 2);
-                    uint32_t min_timeout_us = zc_period_us * 3;
-                    uint8_t min_timeout_ms = (min_timeout_us > 255000u) ? 255 : (uint8_t)((min_timeout_us + 999u) / 1000u);
-                    if (min_timeout_ms < 10) min_timeout_ms = 10;
-                    if (adaptive_timeout_ms < min_timeout_ms) adaptive_timeout_ms = min_timeout_ms;
-                }
-                if (rpm_governor_failsafe_update(&governor_failsafe, zero_crosses, newinput, adaptive_timeout_ms, governor_enabled, running)) {
-                    input_override = 0;
-                    speedPid.error = 0;
-                    speedPid.integral = 0;
-                    governor_rpm_target = 0;
-                    target_e_com_time = 0;
-                }
-                if (zero_crosses < 100) {
-                    speedPid.integral = 0;
-                }
-            } else if (use_speed_control_loop && running) {
+            if (use_speed_control_loop && running) {
                 input_override += doPidCalculations(&speedPid, e_com_time, target_e_com_time);
                 if (input_override > 2047 * 10000) {
                     input_override = 2047 * 10000;
@@ -2019,9 +1979,6 @@ int main(void)
     if (drive_by_rpm) {
         use_speed_control_loop = 1;
     }
-    if (governor_enabled) {
-        use_speed_control_loop = 1;
-    }
 #endif
 
 #endif // end fixed duty mode ifdef
@@ -2351,6 +2308,10 @@ if(zero_crosses < 5){
             }else{
 							duty_cycle_maximum = 2000;
 						}
+            // Governor mode: disable duty cap when motor is running and governor active
+            if (governor_enabled && drive_by_rpm && running) {
+                duty_cycle_maximum = 2000;
+            }
 
             if (degrees_celsius > eepromBuffer.limits.temperature) {
               duty_cycle_maximum = map(degrees_celsius, eepromBuffer.limits.temperature - 10, eepromBuffer.limits.temperature + 10,
