@@ -1024,6 +1024,24 @@ void startMotor()
     enableCompInterrupts();
 }
 
+static inline uint32_t fast_int_sqrt32(uint32_t val) {
+    uint32_t res = 0;
+    uint32_t bit = 1UL << 30; // The second-to-top bit is set: 1L<<30 for uint32
+    while (bit > val) {
+        bit >>= 2;
+    }
+    while (bit != 0) {
+        if (val >= res + bit) {
+            val -= res + bit;
+            res = (res >> 1) + bit;
+        } else {
+            res >>= 1;
+        }
+        bit >>= 2;
+    }
+    return res;
+}
+
 void setInput()
 {
     if (eepromBuffer.bi_direction) {
@@ -1209,10 +1227,17 @@ void setInput()
         } else {
             if (use_speed_control_loop) {
                 if (drive_by_rpm) {
-                    target_e_com_time = 60000000 / map(adjusted_input, 47, 2047,
-                        governor_enabled ? governor_rpm_min : MINIMUM_RPM_SPEED_CONTROL,
-                        governor_enabled ? governor_rpm_max : MAXIMUM_RPM_SPEED_CONTROL)
-                        / (eepromBuffer.motor_poles / 2);
+                    uint32_t r_min = governor_enabled ? governor_rpm_min : MINIMUM_RPM_SPEED_CONTROL;
+                    uint32_t r_max = governor_enabled ? governor_rpm_max : MAXIMUM_RPM_SPEED_CONTROL;
+                    uint32_t r_min_sq = r_min * r_min;
+                    uint32_t r_max_sq = r_max * r_max;
+                    uint32_t throttle_range = 2000; // 2047 - 47
+                    uint32_t throttle_in = (adjusted_input > 47) ? (uint32_t)(adjusted_input - 47) : 0;
+                    if (throttle_in > throttle_range) throttle_in = throttle_range;
+                    uint32_t rpm_sq = r_min_sq + (uint32_t)(((uint64_t)throttle_in * (r_max_sq - r_min_sq)) / throttle_range);
+                    uint32_t target_rpm_val = fast_int_sqrt32(rpm_sq);
+
+                    target_e_com_time = 60000000UL / target_rpm_val / (eepromBuffer.motor_poles / 2);
                     if (adjusted_input < 47) {
                         input = 0;
                         speedPid.error = 0;
@@ -1229,9 +1254,6 @@ void setInput()
                             // ff_duty = target_rpm * 200000 / (motor_kv * battery_voltage)
                             int32_t ff_input = 48;
                             if (battery_voltage > 100 && motor_kv > 0) {
-                                uint32_t target_rpm_val = map(adjusted_input, 47, 2047,
-                                    governor_enabled ? governor_rpm_min : MINIMUM_RPM_SPEED_CONTROL,
-                                    governor_enabled ? governor_rpm_max : MAXIMUM_RPM_SPEED_CONTROL);
                                 uint32_t ff_duty = target_rpm_val * 200000UL
                                                  / ((uint32_t)motor_kv * (uint32_t)battery_voltage);
                                 if (ff_duty < minimum_duty_cycle) ff_duty = minimum_duty_cycle;
