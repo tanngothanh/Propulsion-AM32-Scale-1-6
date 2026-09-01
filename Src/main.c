@@ -619,7 +619,7 @@ static void applyGovernorConfig(void)
     rpm_governor_failsafe_reset(&governor_failsafe, zero_crosses);
     // ponytail: governor requires forward-only DShot; sine-start/stall/BI must be off.
     // Upgrade path: lift restriction after bench validation of sine/governor handover.
-    if (eepromBuffer.bi_direction || eepromBuffer.use_sine_start || eepromBuffer.stall_protection) {
+    if (eepromBuffer.bi_direction || eepromBuffer.use_sine_start) {
         return;
     }
     if (!rpm_governor_validate_config((const uint8_t *)&eepromBuffer.can.governor)) {
@@ -635,12 +635,15 @@ static void applyGovernorConfig(void)
     }
     governor_rpm_min = (uint32_t)mn * 100u;
     governor_rpm_max = (uint32_t)mx * 100u;
-    speedPid.Kp = eepromBuffer.can.governor.kp_raw;
-    speedPid.Ki = eepromBuffer.can.governor.ki_raw;
-    speedPid.Kd = 0; // PI only
+    speedPid.Kp = (uint32_t)eepromBuffer.can.governor.kp_raw * 40u;  // acts as I-gain in velocity form
+    speedPid.Ki = 0;   // MUST be 0: input_override += already integrates, Ki would double-integrate
+    speedPid.Kd = (uint32_t)eepromBuffer.can.governor.ki_raw * 40u;  // acts as P-gain in velocity form
+    speedPid.integral_limit = 20470000;  // full DShot range (2047 * 10000)
+    speedPid.output_limit   = 50000;     // ~5 DShot counts/tick (500ms to full throttle)
     governor_slew_div_250 = eepromBuffer.can.governor.slew_div_250;
     governor_erpm_loss_ms = eepromBuffer.can.governor.erpm_loss_ms;
     governor_enabled = 1;
+    use_speed_control_loop = 1;
 }
 
 void loadEEpromSettings()
@@ -1552,7 +1555,15 @@ void tenKhzRoutine()
                 if (input_override < 0) {
                     input_override = 0;
                 }
-                if (rpm_governor_failsafe_update(&governor_failsafe, zero_crosses, newinput, governor_erpm_loss_ms, governor_enabled, running)) {
+                uint8_t adaptive_timeout_ms = governor_erpm_loss_ms;
+                if (governor_rpm_target > 0 && adaptive_timeout_ms > 0) {
+                    uint32_t zc_period_us = 60000000UL / governor_rpm_target / (eepromBuffer.motor_poles / 2);
+                    uint32_t min_timeout_us = zc_period_us * 3;
+                    uint8_t min_timeout_ms = (min_timeout_us > 255000u) ? 255 : (uint8_t)((min_timeout_us + 999u) / 1000u);
+                    if (min_timeout_ms < 10) min_timeout_ms = 10;
+                    if (adaptive_timeout_ms < min_timeout_ms) adaptive_timeout_ms = min_timeout_ms;
+                }
+                if (rpm_governor_failsafe_update(&governor_failsafe, zero_crosses, newinput, adaptive_timeout_ms, governor_enabled, running)) {
                     input_override = 0;
                     speedPid.error = 0;
                     speedPid.integral = 0;
