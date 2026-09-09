@@ -686,9 +686,8 @@ void loadEEpromSettings()
     }
 
     if (eepromBuffer.pwm_frequency < 145 && eepromBuffer.pwm_frequency > 7) {
-      int divider = eepromBuffer.pwm_frequency * 100 / 6;
-      TIMER1_MAX_ARR =   TIM1_AUTORELOAD * 400 / divider;
-      SET_AUTO_RELOAD_PWM(TIMER1_MAX_ARR);
+      tim1_arr = ((uint32_t)CPU_FREQUENCY_MHZ * 1000000U / ((uint32_t)eepromBuffer.pwm_frequency * 1000U)) - 1;
+      SET_AUTO_RELOAD_PWM(tim1_arr);
     } else {
       tim1_arr = TIM1_AUTORELOAD;
       SET_AUTO_RELOAD_PWM(tim1_arr);
@@ -2266,11 +2265,21 @@ if(zero_crosses < 5){
 #else
             battery_voltage = ((7 * battery_voltage) + ((ADC_raw_volts * 3300 / 4095 * VOLTAGE_DIVIDER) / 100)) >> 3;
             smoothed_raw_current = getSmoothedCurrent();
-            actual_current = ((smoothed_raw_current * 3300 / 41) - (CURRENT_OFFSET * 100)) / (MILLIVOLT_PER_AMP);
-#endif
-            if (actual_current < 0) {
-                actual_current = 0;
-            }             
+            static uint32_t calibrated_current_offset = (CURRENT_OFFSET * 100);
+            static uint8_t current_calibrated = 0;
+            static uint16_t current_cal_samples = 0;
+            static uint32_t current_cal_sum = 0;
+            if (!armed && !running && !current_calibrated) {
+                current_cal_sum += ((uint32_t)smoothed_raw_current * 3300 / 41);
+                current_cal_samples++;
+                if (current_cal_samples >= 64) {
+                    calibrated_current_offset = current_cal_sum >> 6;
+                    current_calibrated = 1;
+                }
+            }
+            int32_t raw_current_val = (((int32_t)smoothed_raw_current * 3300 / 41) - (int32_t)calibrated_current_offset) / (MILLIVOLT_PER_AMP);
+            actual_current = (raw_current_val > 0) ? (int16_t)raw_current_val : 0;
+#endif             
             if (eepromBuffer.low_voltage_cut_off == 1) {  
                 if (battery_voltage < (cell_count * low_cell_volt_cutoff)) {
                   low_voltage_count++;

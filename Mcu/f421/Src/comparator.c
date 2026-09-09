@@ -39,14 +39,8 @@ void changeCompInput()
 //        EXINT->polcfg1 |= (uint32_t)EXTI_LINE;
 //        EXINT->polcfg2 = 0;
 //    }
-    if((average_interval < 400)){ 
-        //set comp to high speed mode
-        CMP->ctrlsts = CMP->ctrlsts & ~(1<<2);
-    }
-    if((average_interval > 600)){
-        //set comp to medium speed mode
-        CMP->ctrlsts  = CMP->ctrlsts | 1<<2;
-    }
+    // Set comparator always to high speed mode (<50ns delay) for crisp BEMF zero-crossing detection
+    CMP->ctrlsts = CMP->ctrlsts & ~(1 << 2);
 	EXINT->polcfg1 = !rising << 21;
     EXINT->polcfg2 = rising << 21;
 }
