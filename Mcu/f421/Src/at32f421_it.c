@@ -180,14 +180,10 @@ void DMA1_Channel5_4_IRQHandler(void)
  */
 void ADC1_CMP_IRQHandler(void)
 {
-  if((INTERVAL_TIMER->cval) > ((average_interval>>1))){
-       EXINT->intsts = EXTI_LINE;
-       interruptRoutine();
-    }else{ 
-      if (getCompOutputLevel() == rising){
-        EXINT->intsts = EXTI_LINE;
+    EXINT->intsts = EXTI_LINE;
+    if ((INTERVAL_TIMER->cval > 150) && ((INTERVAL_TIMER->cval) > (average_interval >> 1))) {
+        interruptRoutine();
     }
-  }
 }
 
 /**

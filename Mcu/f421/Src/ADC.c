@@ -127,7 +127,8 @@ int16_t getNTCDegrees(uint16_t ntcrawtemp){
 
 int16_t getConvertedDegrees(uint16_t adcrawtemp)
 {
-    return (12800 - (int32_t)adcrawtemp * 33000 / 4096) / -42 + 25;
+    // Calibrated AT32F421 internal sensor: V25 = 1.3514V, Slope = -4.3 mV/C
+    return (13514 - (int32_t)adcrawtemp * 33000 / 4096) / -43 + 25;
 }
 
 #endif // USE_ADC

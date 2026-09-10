@@ -54,6 +54,7 @@ extern uint8_t max_duty_cycle_change;
 int dshot_full_number;
 extern char play_tone_flag;
 extern char send_esc_info_flag;
+extern uint8_t governor_enabled;
 uint8_t command_count = 0;
 uint8_t last_command = 0;
 uint8_t high_pin_count = 0;
@@ -61,7 +62,7 @@ uint32_t gcr[37] = { 0 };
 uint16_t dshot_frametime;
 uint16_t dshot_goodcounts;
 uint16_t dshot_badcounts;
-uint8_t dshot_extended_telemetry = 0;
+uint8_t dshot_extended_telemetry = 1;
 uint16_t processtime = 0;
 uint16_t halfpulsetime = 0;
 
@@ -131,6 +132,7 @@ void computeDshotDMA()
                     newinput = tocheck;
                     dshotcommand = 0;
                     command_count = 0;
+                    zero_input_count = 0;
                     return;
                 }
             }
@@ -152,6 +154,9 @@ void computeDshotDMA()
                 newinput = 0;
                 dshotcommand = 0;
                 command_count = 0;
+                if (!armed) {
+                    zero_input_count++;
+                }
             }
 
             if ((dshotcommand > 0) && (running == 0) && armed) {
@@ -262,7 +267,9 @@ void make_dshot_package(uint16_t com_time)
                 telem_scheduler.voltage_count = 0;
             }
             else if (telem_scheduler.temp_count >= TEMP_EDT_RATE_DIVISOR) {
-                extended_frame_to_send = 0b0010 << 8 | (uint8_t)degrees_celsius;
+                extern volatile int16_t degrees_celsius;
+                uint8_t temp_c = (degrees_celsius > 0) ? (uint8_t)degrees_celsius : 0;
+                extended_frame_to_send = 0b0010 << 8 | temp_c;
                 telem_scheduler.temp_count = 0;
             }
         }
@@ -281,24 +288,25 @@ void make_dshot_package(uint16_t com_time)
         telem_scheduler.last_sent_extended = 1;
 
     } else {
-        if (!running) {
-            com_time = 65535;
-        }
-        //	calculate shift amount for data in format eee mmm mmm mmm, first 1 found
-        // in first seven bits of data determines shift amount
-        // this allows for a range of up to 65408 microseconds which would be
-        // shifted 0b111 (eee) or 7 times.
-        for (int i = 15; i >= 9; i--) {
-            if (com_time >> i == 1) {
-                shift_amount = i + 1 - 9;
-                break;
-            } else {
-                shift_amount = 0;
+        if (!running || zero_crosses < 6) {
+            dshot_full_number = 0x0FFF; // DShot standard zero-eRPM frame (0xFFF0 on wire)
+        } else {
+            //	calculate shift amount for data in format eee mmm mmm mmm, first 1 found
+            // in first seven bits of data determines shift amount
+            // this allows for a range of up to 65408 microseconds which would be
+            // shifted 0b111 (eee) or 7 times.
+            for (int i = 15; i >= 9; i--) {
+                if (com_time >> i == 1) {
+                    shift_amount = i + 1 - 9;
+                    break;
+                } else {
+                    shift_amount = 0;
+                }
             }
+            // shift the commutation time to allow for expanded range and put shift
+            // amount in first three bits
+            dshot_full_number = ((shift_amount << 9) | (com_time >> shift_amount));
         }
-        // shift the commutation time to allow for expanded range and put shift
-        // amount in first three bits
-        dshot_full_number = ((shift_amount << 9) | (com_time >> shift_amount));
     }
     // calculate checksum
     uint16_t csum = 0;

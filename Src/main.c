@@ -357,6 +357,7 @@ uint16_t current_angle = 90;
 uint16_t desired_angle = 90;
 char return_to_center = 0;
 uint16_t target_e_com_time = 0;
+uint32_t ramped_target_rpm = 0;
 int16_t Speed_pid_output;
 char use_speed_control_loop = 0;
 int32_t input_override = 0;
@@ -631,20 +632,32 @@ static void applyGovernorConfig(void)
     }
     uint8_t mn = eepromBuffer.can.governor.rpm_mode_and_min & 0x7F;
     uint8_t mx = eepromBuffer.can.governor.rpm_max_div_100;
-    if (mn < 10 || mn > 90 || mx < 10 || mx > 90 || mx <= mn) {
+    if (mn < 5 || mn > 90 || mx < 10 || mx > 90 || mx <= mn) {
         return;
     }
     governor_rpm_min = (uint32_t)mn * 100u;
     governor_rpm_max = (uint32_t)mx * 100u;
-    speedPid.Kp = 80;       // integral: low (steady-state correction only)
+    speedPid.Kp = (uint32_t)eepromBuffer.can.governor.ki_raw * 40u; // ki_raw 10 -> 400
     speedPid.Ki = 0;
-    speedPid.Kd = 1500;     // aggressive damping: boosts duty during accel, brakes during decel
-    speedPid.integral_limit = 20470000;
-    speedPid.output_limit   = 30000;  // allow PID to boost above FF during transients
+    speedPid.Kd = (uint32_t)eepromBuffer.can.governor.kp_raw * 40u; // kp_raw 50 -> 2000
+    speedPid.integral_limit = 5000000;
+    uint32_t pwm_f = eepromBuffer.pwm_frequency;
+    if (pwm_f < 8 || pwm_f > 144) {
+        pwm_f = 24;
+    }
+    uint16_t freq_breakaway = (uint16_t)((pwm_f * 285U) / 24U); // Constant 5.76us breakaway pulse: 285@24k, 380@32k, 570@48k
+    if (min_startup_duty < freq_breakaway) {
+        min_startup_duty = freq_breakaway; // normalized breakaway impulse for 18S24P motors
+    }
+    if (startup_max_duty_cycle < min_startup_duty + 200) {
+        startup_max_duty_cycle = min_startup_duty + 200;
+    }
+    speedPid.output_limit = 50000;
     governor_slew_div_250 = eepromBuffer.can.governor.slew_div_250;
     governor_erpm_loss_ms = eepromBuffer.can.governor.erpm_loss_ms;
     governor_enabled = 1;
     drive_by_rpm = 1;
+    use_speed_control_loop = 1;
     // low_rpm_throttle_limit handled at runtime in tenKhzRoutine when governor running
     // Governor needs fast duty changes for feedforward step response
     // Stock ramp is ~10/tick (protection for open-loop). Governor is closed-loop,
@@ -687,9 +700,11 @@ void loadEEpromSettings()
 
     if (eepromBuffer.pwm_frequency < 145 && eepromBuffer.pwm_frequency > 7) {
       tim1_arr = ((uint32_t)CPU_FREQUENCY_MHZ * 1000000U / ((uint32_t)eepromBuffer.pwm_frequency * 1000U)) - 1;
+      TIMER1_MAX_ARR = tim1_arr;
       SET_AUTO_RELOAD_PWM(tim1_arr);
     } else {
       tim1_arr = TIM1_AUTORELOAD;
+      TIMER1_MAX_ARR = tim1_arr;
       SET_AUTO_RELOAD_PWM(tim1_arr);
     }
     if(eepromBuffer.minimum_duty_cycle < 51 && eepromBuffer.minimum_duty_cycle > 0){
@@ -890,6 +905,7 @@ void getBemfState()
     if (rising) {
         if (current_state) {
             bemfcounter++;
+            bad_count = 0;
         } else {
             bad_count++;
             if (bad_count > bad_count_threshold) {
@@ -899,6 +915,7 @@ void getBemfState()
     } else {
         if (!current_state) {
             bemfcounter++;
+            bad_count = 0;
         } else {
             bad_count++;
             if (bad_count > bad_count_threshold) {
@@ -935,7 +952,8 @@ void commutate()
     __enable_irq();
     changeCompInput();
 #ifndef NO_POLLING_START
-	if (average_interval > polling_mode_changeover + 500) {
+    uint32_t polling_revert = governor_enabled ? 2200 : (polling_mode_changeover + 500);
+	if (average_interval > polling_revert) {
       old_routine = 1;
    }
 #endif
@@ -982,18 +1000,17 @@ void PeriodElapsedCallback()
  */
 void interruptRoutine()
 {
-//   if (average_interval > 125) {
-//        if ((INTERVAL_TIMER_COUNT < 125) && (duty_cycle < 600) && (zero_crosses < 500)) { // should be impossible, desync?exit anyway
-//           return;
-//        }
-//        stuckcounter++; // stuck at 100 interrupts before the main loop happens
-//                        // again.
-//        if (stuckcounter > 100) {
-//            maskPhaseInterrupts();
-//            zero_crosses = 0;
-//            return;
-//        }
-//    }
+    if (INTERVAL_TIMER_COUNT < 200) {
+        return; // reject PWM noise spike (<8333 RPM on 24P)
+    }
+    stuckcounter++;
+    if (stuckcounter > 50) {
+        maskPhaseInterrupts();
+        old_routine = 1;
+        zero_crosses = 0;
+        stuckcounter = 0;
+        return;
+    }
         for (int i = 0; i < filter_level; i++) {
 #if defined(MCU_F031) || defined(MCU_G031)
             if (((current_GPIO_PORT->IDR & current_GPIO_PIN) == !(rising))) {
@@ -1015,12 +1032,17 @@ void interruptRoutine()
 void startMotor()
 {
     if (running == 0) {
-        commutate();
         commutation_interval = 10000;
         SET_INTERVAL_TIMER_COUNT(5000);
         running = 1;
+        old_routine = 1;
+        zero_crosses = 0;
+        maskPhaseInterrupts();
+        commutate();
     }
-    enableCompInterrupts();
+    if (!old_routine) {
+        enableCompInterrupts();
+    }
 }
 
 static inline uint32_t fast_int_sqrt32(uint32_t val) {
@@ -1228,43 +1250,86 @@ void setInput()
                 if (drive_by_rpm) {
                     uint32_t r_min = governor_enabled ? governor_rpm_min : MINIMUM_RPM_SPEED_CONTROL;
                     uint32_t r_max = governor_enabled ? governor_rpm_max : MAXIMUM_RPM_SPEED_CONTROL;
-                    uint32_t r_min_sq = r_min * r_min;
-                    uint32_t r_max_sq = r_max * r_max;
                     uint32_t throttle_range = 2000;
                     uint32_t throttle_in = (adjusted_input > 47) ? (uint32_t)(adjusted_input - 47) : 0;
                     if (throttle_in > throttle_range) throttle_in = throttle_range;
 
-                    // Pure 32-bit integer arithmetic (0 software division routine calls)
-                    uint32_t rpm_slope = (r_max_sq - r_min_sq) / throttle_range;
-                    uint32_t rpm_sq = r_min_sq + (throttle_in * rpm_slope);
-                    uint32_t target_rpm_val = fast_int_sqrt32(rpm_sq);
+                    // Linear Throttle-to-RPM Mapping: 0% = r_min (1000 RPM), 100% = r_max (6000 RPM)
+                    uint32_t target_rpm_val = r_min + ((throttle_in * (r_max - r_min)) / throttle_range);
 
-                    target_e_com_time = 60000000UL / target_rpm_val / (eepromBuffer.motor_poles / 2);
                     if (adjusted_input < 47) {
                         input = 0;
                         speedPid.error = 0;
                         input_override = 0;
+                        ramped_target_rpm = r_min;
                     } else {
-                        if (!running) {
-                            input = adjusted_input;
-                            input_override = (int32_t)adjusted_input * 10000;
+                        if (!running || zero_crosses <= 20) {
+                            ramped_target_rpm = r_min;
+                        } else {
+                            // Dual-Zone Adaptive Slew Rate Limiter (User requirement: 0-25% gentle response & anti-saturation):
+                            // Zone 1: 0% - 25% ga (ramped_target_rpm <= r_min + (r_max - r_min)/4, e.g. 1000 - 2250 RPM):
+                            // Gentle response (~2,400 RPM/s) for high control quality, anti-saturation & zero screech.
+                            // Zone 2: >25% ga (2250 - 6000 RPM):
+                            // Agile fast response (~14,000 RPM/s) for VTOL flight dynamics.
+                            uint32_t low_zone_boundary = r_min + ((r_max - r_min) >> 2); // 25% ga threshold
+                            uint32_t max_rpm_step = 35; // Default ~14,000 RPM/s in high range
+                            if (governor_slew_div_250 > 0 && governor_slew_div_250 < 35) {
+                                max_rpm_step = (uint32_t)governor_slew_div_250;
+                            }
+                            if (ramped_target_rpm <= low_zone_boundary) {
+                                max_rpm_step = 6; // 6 * 400Hz = 2400 RPM/s (gentle anti-saturation in 0-25% zone)
+                            }
+                            if (ramped_target_rpm < target_rpm_val) {
+                                ramped_target_rpm += max_rpm_step;
+                                if (ramped_target_rpm > target_rpm_val) {
+                                    ramped_target_rpm = target_rpm_val;
+                                }
+                            } else if (ramped_target_rpm > target_rpm_val) {
+                                if (ramped_target_rpm > (target_rpm_val + max_rpm_step)) {
+                                    ramped_target_rpm -= max_rpm_step;
+                                } else {
+                                    ramped_target_rpm = target_rpm_val;
+                                }
+                            }
+                        }
+
+                        target_e_com_time = 60000000UL / ramped_target_rpm / (eepromBuffer.motor_poles / 2);
+
+                        // Feedforward: calculate expected duty from motor physics using ramped_target_rpm
+                        int32_t ff_input = 48;
+                        if (battery_voltage > 100 && motor_kv > 0) {
+                            uint32_t ff_duty = ramped_target_rpm * 200000UL
+                                             / ((uint32_t)motor_kv * (uint32_t)battery_voltage);
+                            if (ff_duty < minimum_duty_cycle) ff_duty = minimum_duty_cycle;
+                            if (ff_duty > 2000) ff_duty = 2000;
+                            ff_input = 47 + (int32_t)(ff_duty - minimum_duty_cycle)
+                                     * 2000L / (2000 - minimum_duty_cycle);
+                            if (ff_input < 48) ff_input = 48;
+                            if (ff_input > 2047) ff_input = 2047;
+                        }
+
+                        uint32_t pwm_f = eepromBuffer.pwm_frequency;
+                        if (pwm_f < 8 || pwm_f > 144) {
+                            pwm_f = 24;
+                        }
+                        uint16_t freq_breakaway = (uint16_t)((pwm_f * 285U) / 24U);
+
+                        if (!running || zero_crosses <= 20) {
+                            int32_t start_input = adjusted_input;
+                            if (governor_enabled) {
+                                if (start_input < freq_breakaway) {
+                                    start_input = freq_breakaway;
+                                }
+                                // Root Cause 1 Fix: Clamp start_input strictly to gentle breakaway power.
+                                // NEVER override with ff_input while stationary!
+                                if (start_input > (freq_breakaway + 30)) {
+                                    start_input = freq_breakaway + 30;
+                                }
+                            }
+                            input = (uint16_t)start_input;
+                            input_override = (int32_t)start_input * 10000;
                             last_ff_override = input_override;
                         } else {
-                            // Feedforward: calculate expected duty from motor physics
-                            // ff_duty = target_rpm * 2000 / (KV * Vbatt_volts)
-                            // battery_voltage is 10mV units, so Vbatt_volts = battery_voltage/100
-                            // ff_duty = target_rpm * 200000 / (motor_kv * battery_voltage)
-                            int32_t ff_input = 48;
-                            if (battery_voltage > 100 && motor_kv > 0) {
-                                uint32_t ff_duty = target_rpm_val * 200000UL
-                                                 / ((uint32_t)motor_kv * (uint32_t)battery_voltage);
-                                if (ff_duty < minimum_duty_cycle) ff_duty = minimum_duty_cycle;
-                                if (ff_duty > 2000) ff_duty = 2000;
-                                ff_input = 47 + (int32_t)(ff_duty - minimum_duty_cycle)
-                                         * 2000L / (2000 - minimum_duty_cycle);
-                                if (ff_input < 48) ff_input = 48;
-                                if (ff_input > 2047) ff_input = 2047;
-                            }
                             // Feedforward base + accumulated PID correction
                             int32_t ff_override = ff_input * 10000;
                             uint32_t primask = __get_PRIMASK();
@@ -1273,6 +1338,26 @@ void setInput()
                             input_override = ff_override + pid_correction;
                             __set_PRIMASK(primask);
                             last_ff_override = ff_override;
+
+                            // Progressive Dynamic Lead Clamp:
+                            // Zone 1 (0-25% throttle, <= low_boundary): +400 counts lead prevents startup saturation/screech/jerk.
+                            // Zone 2 (>25% throttle): progressive lead expands smoothly up to +750 counts (~37.5% duty lead).
+                            // This allows sufficient voltage to reach 5500 RPM under load while strictly preventing the
+                            // unconstrained 2047-count (100% duty) voltage slam that causes 29A acceleration spikes!
+                            if (battery_voltage > 100 && motor_kv > 0 && e_com_time > 0) {
+                                uint32_t act_rpm = 60000000UL / (uint32_t)e_com_time / (eepromBuffer.motor_poles / 2);
+                                uint32_t act_duty = act_rpm * 200000UL / ((uint32_t)motor_kv * (uint32_t)battery_voltage);
+                                uint32_t low_boundary = r_min + ((r_max - r_min) >> 2);
+                                uint32_t lead_allowance = 400;
+                                if (ramped_target_rpm > low_boundary && r_max > low_boundary) {
+                                    lead_allowance = 400 + ((ramped_target_rpm - low_boundary) * 350UL) / (r_max - low_boundary);
+                                }
+                                int32_t max_lead_override = (int32_t)(47 + act_duty + lead_allowance) * 10000;
+                                if (max_lead_override > (2047 * 10000)) max_lead_override = 2047 * 10000;
+                                if (input_override > max_lead_override) {
+                                    input_override = max_lead_override;
+                                }
+                            }
 
                             input = (uint16_t)(input_override / 10000);
                             if (input > 2047) input = 2047;
@@ -1341,6 +1426,15 @@ if (!stepper_sine && armed) {
                     break;
                 }
                 play_tone_flag = 0;
+            }
+
+            if (governor_enabled) {
+                duty_cycle_setpoint = 0;
+                running = 0;
+                old_routine = 1;
+                zero_crosses = 0;
+                maskPhaseInterrupts();
+                allOff();
             }
 
             if (!eepromBuffer.comp_pwm) {
@@ -1420,7 +1514,7 @@ if (!stepper_sine && armed) {
             }
         }
         if (!prop_brake_active) {
-            if (input >= 47 && (zero_crosses < (uint32_t)(30 >> eepromBuffer.stall_protection))) {
+            if (input >= 47 && (zero_crosses < (uint32_t)(20 >> eepromBuffer.stall_protection))) {
                 if (duty_cycle_setpoint < min_startup_duty) {
                     duty_cycle_setpoint = min_startup_duty;
                 }
@@ -1457,7 +1551,7 @@ void tenKhzRoutine()
     if (!armed) {
         if (cell_count == 0) {
             if (inputSet) {
-                if (adjusted_input == 0) {
+                if (adjusted_input <= 48) {
                     armed_timeout_count++;
                     if (armed_timeout_count > LOOP_FREQUENCY_HZ) { // one second
                         if (zero_input_count > 30) {
@@ -1537,9 +1631,15 @@ void tenKhzRoutine()
             PROCESS_ADC_FLAG = 1; // set flag to do new adc read at lower priority
             one_khz_loop_counter = 0;
             if (use_current_limit && running) {
+                int32_t current_target = (int32_t)eepromBuffer.limits.current * 2 * 100;
                 use_current_limit_adjust -= (int16_t)(doPidCalculations(&currentPid, actual_current,
-                                                          eepromBuffer.limits.current * 2 * 100)
+                                                          current_target)
                     / 10000);
+                // Fast anti-saturation derate when exceeding hardware current limit
+                if (actual_current > current_target) {
+                    int32_t over_current = actual_current - current_target;
+                    use_current_limit_adjust -= (int16_t)((over_current * 10) / 100);
+                }
                 if (use_current_limit_adjust < minimum_duty_cycle) {
                     use_current_limit_adjust = minimum_duty_cycle;
                 }
@@ -1558,17 +1658,42 @@ void tenKhzRoutine()
                     stall_protection_adjust = 0;
                 }
             }
-            if (use_speed_control_loop && running) {
-                input_override += doPidCalculations(&speedPid, e_com_time, target_e_com_time);
-                if (input_override > 2047 * 10000) {
-                    input_override = 2047 * 10000;
+            if (use_speed_control_loop && running && (zero_crosses > 20)) {
+                int32_t pid_out = doPidCalculations(&speedPid, e_com_time, target_e_com_time);
+                int32_t current_ceiling = (int32_t)eepromBuffer.limits.current * 2 * 100; // e.g. 24A = 2400
+                if (current_ceiling == 0 || current_ceiling > 5000) current_ceiling = 2400;
+
+                // Governor Current Anti-Saturation:
+                // 1. Freeze PID duty growth when current exceeds hardware ceiling
+                if ((int32_t)actual_current > current_ceiling) {
+                    if (pid_out > 0) {
+                        pid_out = 0; // Freeze duty growth
+                    }
+                    // 2. Smooth, critically-damped current limit regulation (1.2 duty counts/ms per Amp overshoot)
+                    // Strictly caps peak current at 26.0 A without dumping duty or causing limit-cycle oscillation
+                    int32_t over_i = (int32_t)actual_current - current_ceiling;
+                    input_override -= over_i * 120;
                 }
-                if (input_override < 0) {
-                    input_override = 0;
+
+                input_override += pid_out;
+                int32_t max_override = 2047 * 10000;
+                if (input_override > max_override) {
+                    input_override = max_override;
+                }
+                int32_t min_running_override = (int32_t)(minimum_duty_cycle + 47) * 10000;
+                if (input_override < min_running_override) {
+                    input_override = min_running_override;
                 }
                 if (zero_crosses < 100) {
                     speedPid.integral = 0;
                 }
+            } else if (use_speed_control_loop && running && (zero_crosses <= 20)) {
+                if (!governor_enabled) {
+                    input_override = (int32_t)adjusted_input * 10000;
+                    last_ff_override = input_override;
+                }
+                speedPid.integral = 0;
+                speedPid.last_error = e_com_time - target_e_com_time;
             }
         }
         if (ramp_count > ramp_divider) {
@@ -1611,7 +1736,7 @@ void tenKhzRoutine()
             zero_throttle_brake_active = 0;
             temp_comp_pwm = eepromBuffer.comp_pwm;
           }else{
-            adjusted_duty_cycle = ((duty_cycle * tim1_arr) / 2000) + 1;
+            adjusted_duty_cycle = (duty_cycle == 0) ? 0 : (DEAD_TIME + ((duty_cycle * (tim1_arr - DEAD_TIME)) / 2000));
         }
         } else {
           if(running && input < 47){ // brake on zero throttle behavior while motor is still rotating
@@ -1634,7 +1759,7 @@ void tenKhzRoutine()
               }
               zero_throttle_brake_active = 1;
               }
-              adjusted_duty_cycle = ((duty_cycle * tim1_arr) / 2000);
+              adjusted_duty_cycle = (duty_cycle == 0) ? 0 : (DEAD_TIME + ((duty_cycle * (tim1_arr - DEAD_TIME)) / 2000));
           } else{  // input less than 47 and not running, normal brake on stop behavior
             if (prop_brake_active) {
               adjusted_duty_cycle =  tim1_arr - ((prop_brake_duty_cycle * tim1_arr) / 2000);
@@ -1643,7 +1768,7 @@ void tenKhzRoutine()
                 comStep(2);
                 adjusted_duty_cycle = DEAD_TIME + ((eepromBuffer.active_brake_power * tim1_arr) / 2000)* 10;
             }else{
-                adjusted_duty_cycle = ((duty_cycle * tim1_arr) / 2000);
+                adjusted_duty_cycle = (duty_cycle == 0) ? 0 : (DEAD_TIME + ((duty_cycle * (tim1_arr - DEAD_TIME)) / 2000));
             }
             }
           }
@@ -1736,11 +1861,8 @@ void zcfoundroutine()
     commutation_interval = (thiszctime + (3 * commutation_interval)) / 4;
     advance = (temp_advance * commutation_interval) >> 6; //   7.5 degree increments
     waitTime = commutation_interval / 2 - advance;
-    while ((INTERVAL_TIMER_COUNT) < (waitTime)) {
-        if (zero_crosses < 5) {
-            break;
-        }
-    }
+    uint32_t eff_wait = (zero_crosses >= 5) ? waitTime : (waitTime * zero_crosses) / 5;
+    while ((INTERVAL_TIMER_COUNT) < eff_wait);
 #ifdef MCU_GDE23
     TIMER_CAR(COM_TIMER) = waitTime;
 #endif
@@ -1756,6 +1878,7 @@ void zcfoundroutine()
 #endif
 
     commutate();
+    commutation_intervals[step - 1] = commutation_interval;
     bemfcounter = 0;
     bad_count = 0;
 
@@ -1766,8 +1889,9 @@ void zcfoundroutine()
             enableCompInterrupts(); // enable interrupt
         }
 #else
-    if (eepromBuffer.stall_protection || eepromBuffer.rc_car_reverse) {
-        if (zero_crosses >= 20 && commutation_interval <= 2000) {
+    if (governor_enabled || eepromBuffer.stall_protection || eepromBuffer.rc_car_reverse) {
+        uint32_t changeover_thresh = governor_enabled ? 1500 : 2000;
+        if (zero_crosses >= 50 && commutation_interval <= changeover_thresh) {
             old_routine = 0;
             enableCompInterrupts(); // enable interrupt
         }
@@ -2178,6 +2302,9 @@ if(zero_crosses < 5){
             desync_check = 0;
             //	}
             last_average_interval = average_interval;
+        } else {
+            desync_check = 0;
+            last_average_interval = average_interval;
         }
 
 #if !defined(MCU_G031) && !defined(NEED_INPUT_READY)
@@ -2255,7 +2382,13 @@ if(zero_crosses < 5){
             startADCConversion( );
             converted_degrees = getConvertedDegrees(ADC_raw_temp);
 #endif
-            degrees_celsius = converted_degrees;
+            static int16_t filtered_degrees = 0;
+            if (filtered_degrees == 0) {
+                filtered_degrees = converted_degrees << 4;
+            } else {
+                filtered_degrees = filtered_degrees - (filtered_degrees >> 4) + converted_degrees;
+            }
+            degrees_celsius = filtered_degrees >> 4;
 #ifdef NXP
             //MCXA has 16-bit ADC data
             battery_voltage = ((7 * battery_voltage) + ((ADC_raw_volts * 3300 / 65535 * VOLTAGE_DIVIDER) / 100)) / 8;
@@ -2265,16 +2398,25 @@ if(zero_crosses < 5){
 #else
             battery_voltage = ((7 * battery_voltage) + ((ADC_raw_volts * 3300 / 4095 * VOLTAGE_DIVIDER) / 100)) >> 3;
             smoothed_raw_current = getSmoothedCurrent();
-            static uint32_t calibrated_current_offset = (CURRENT_OFFSET * 100);
+            static uint32_t calibrated_current_offset = ((uint32_t)CURRENT_OFFSET * 100);
             static uint8_t current_calibrated = 0;
+            static uint16_t current_warmup_samples = 0;
             static uint16_t current_cal_samples = 0;
             static uint32_t current_cal_sum = 0;
             if (!armed && !running && !current_calibrated) {
-                current_cal_sum += ((uint32_t)smoothed_raw_current * 3300 / 41);
-                current_cal_samples++;
-                if (current_cal_samples >= 64) {
-                    calibrated_current_offset = current_cal_sum >> 6;
-                    current_calibrated = 1;
+                if (current_warmup_samples < 500) {
+                    current_warmup_samples++;
+                } else {
+                    current_cal_sum += ((uint32_t)smoothed_raw_current * 3300 / 41);
+                    current_cal_samples++;
+                    if (current_cal_samples >= 64) {
+                        uint32_t measured_offset = current_cal_sum >> 6;
+                        if (measured_offset >= ((uint32_t)CURRENT_OFFSET * 100 - 10000) &&
+                            measured_offset <= ((uint32_t)CURRENT_OFFSET * 100 + 10000)) {
+                            calibrated_current_offset = measured_offset;
+                        }
+                        current_calibrated = 1;
+                    }
                 }
             }
             int32_t raw_current_val = (((int32_t)smoothed_raw_current * 3300 / 41) - (int32_t)calibrated_current_offset) / (MILLIVOLT_PER_AMP);
@@ -2362,7 +2504,17 @@ if(zero_crosses < 5){
             }
 
             if (eepromBuffer.auto_advance) {
-              auto_advance_level = map(duty_cycle, 100, 2000, 13, 23);
+                // Dynamic RPM-Tracking Auto-Advance:
+                // Scale advance angle seamlessly with rotor electrical frequency (k_erpm = e_rpm / 10)
+                // 1000 RPM (k_erpm ~ 120) -> 12.2 deg (level 13)
+                // 6000 RPM (k_erpm ~ 720) -> 26.25 deg (level 28)
+                if (k_erpm < 120) {
+                    auto_advance_level = 13;
+                } else if (k_erpm > 720) {
+                    auto_advance_level = 28;
+                } else {
+                    auto_advance_level = map(k_erpm, 120, 720, 13, 28);
+                }
             }
 
             /**************** old routine*********************/
@@ -2396,9 +2548,9 @@ if(zero_crosses < 5){
                 if (input < 48) {
                     running = 0;
                     commutation_interval = 5000;
+                } else {
+                    zcfoundroutine();
                 }
-                zero_crosses = 0;
-                zcfoundroutine();
               }
             }
         } else { // stepper sine

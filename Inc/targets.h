@@ -1294,8 +1294,9 @@
 #define USE_SERIAL_TELEMETRY
 #define TARGET_VOLTAGE_DIVIDER 74
 #define MILLIVOLT_PER_AMP 45
-#define CURRENT_OFFSET 529 // mv
+#define CURRENT_OFFSET 574 // mv (hardware calibrated resting op-amp offset)
 #define TARGET_STALL_PROTECTION_INTERVAL 7000
+#define TARGET_MIN_BEMF_COUNTS 3
 #endif
 
 #ifdef TEKKO32_F421_32K
@@ -1310,8 +1311,9 @@
 #define USE_SERIAL_TELEMETRY
 #define TARGET_VOLTAGE_DIVIDER 74
 #define MILLIVOLT_PER_AMP 45
-#define CURRENT_OFFSET 529 // mv
+#define CURRENT_OFFSET 574 // mv (hardware calibrated resting op-amp offset)
 #define TARGET_STALL_PROTECTION_INTERVAL 7000
+#define TARGET_MIN_BEMF_COUNTS 3
 #endif
 
 #ifdef TEKKO32_F421_48K
@@ -1326,8 +1328,9 @@
 #define USE_SERIAL_TELEMETRY
 #define TARGET_VOLTAGE_DIVIDER 74
 #define MILLIVOLT_PER_AMP 45
-#define CURRENT_OFFSET 529 // mv
+#define CURRENT_OFFSET 574 // mv (hardware calibrated resting op-amp offset)
 #define TARGET_STALL_PROTECTION_INTERVAL 7000
+#define TARGET_MIN_BEMF_COUNTS 3
 #endif
 
 #ifdef  MICOAIR_743_AIO_F421
