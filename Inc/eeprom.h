@@ -23,7 +23,9 @@ typedef union EEprom_u {
         uint8_t current_D; //11 0-255
         uint8_t active_brake_power; //12  1-5 percent duty cycle
         uint8_t brake_on_zero_throttle; // brake behavior when throttle is 0 but motor is still rotating
-        char reserved_eeprom_3[3]; //13-16  
+        uint8_t advance_max_level; // 14: Max dynamic advance level (0=Auto, 10..42 -> 0..32 in 0.9375 deg units)
+        uint8_t auto_advance_min_rpm_div_100; // 15: Dynamic advance ramp start RPM/100 (0=Auto)
+        uint8_t auto_advance_max_rpm_div_100; // 16: Dynamic advance ramp full RPM/100 (0=Auto)
         uint8_t dir_reversed; // 17
         uint8_t bi_direction; // 18
         uint8_t use_sine_start; // 19
