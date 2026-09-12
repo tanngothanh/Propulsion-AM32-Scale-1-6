@@ -286,7 +286,7 @@ fastPID speedPid = { // commutation speed loop time
     .Ki = 0,
     .Kd = 100,
     .integral_limit = 10000,
-    .output_limit = 5000
+    .output_limit = 50000
 };
 
 fastPID currentPid = { // 1khz loop time
@@ -332,11 +332,10 @@ uint16_t stall_protect_target_interval = TARGET_STALL_PROTECTION_INTERVAL;
 uint16_t enter_sine_angle = 180;
 char do_once_sinemode = 0;
 uint8_t auto_advance_level;
-uint8_t dyn_adv_base = 16;
-uint8_t dyn_adv_max = 28;
-uint32_t dyn_adv_rpm_start = 1000;
-uint32_t dyn_adv_rpm_end = 6000;
-uint8_t dyn_adv_pole_pairs = 7;
+uint8_t dyn_adv_base = 13;
+uint8_t dyn_adv_max = 22;
+uint32_t dyn_adv_rpm_start = 120;
+uint32_t dyn_adv_rpm_end = 720;
 void update_dynamic_advance_params(void);
 volatile uint8_t zero_throttle_brake_active;
 volatile uint8_t temp_comp_pwm;
@@ -576,7 +575,6 @@ volatile uint16_t thiszctime;
 volatile uint16_t duty_cycle = 0;
 char step = 1;
 volatile uint32_t commutation_interval = 12500;
-#define MIN_COMMUTATION_WAIT_TICKS 8U // 4.0us safe minimum timer margin to prevent waitTime underflow/collision
 volatile uint16_t waitTime = 0;
 uint16_t signaltimeout = 0;
 uint8_t ubAnalogWatchdogStatus = RESET;
@@ -659,7 +657,7 @@ static void applyGovernorConfig(void)
     if (startup_max_duty_cycle < min_startup_duty + 200) {
         startup_max_duty_cycle = min_startup_duty + 200;
     }
-    speedPid.output_limit = 5000;
+    speedPid.output_limit = 50000;
     governor_slew_div_250 = eepromBuffer.can.governor.slew_div_250;
     governor_erpm_loss_ms = eepromBuffer.can.governor.erpm_loss_ms;
     governor_enabled = 1;
@@ -672,83 +670,6 @@ static void applyGovernorConfig(void)
     max_ramp_low_rpm = 100;
     max_ramp_high_rpm = 100;
     update_dynamic_advance_params();
-}
-
-void update_dynamic_advance_params(void)
-{
-    // 1. Pole pairs: default 14 poles (7 pole pairs) if not set or invalid
-    uint8_t poles = eepromBuffer.motor_poles;
-    if (poles < 2 || (poles & 1) != 0) {
-        poles = 14;
-    }
-    dyn_adv_pole_pairs = poles / 2;
-
-    // 2. Base advance (low RPM advance angle)
-    dyn_adv_base = temp_advance; // 0..32 in 0.9375 deg steps
-    if (dyn_adv_base > 26) {
-        dyn_adv_base = 26; // Safe base advance ceiling (24.375 deg)
-    }
-
-    // 3. Effective Motor KV
-    uint32_t eff_kv = motor_kv;
-    if (eff_kv < 50) {
-        eff_kv = 740;
-    }
-
-    // 4. Max advance (high RPM advance angle)
-    if (eepromBuffer.advance_max_level >= 10 && eepromBuffer.advance_max_level <= 42) {
-        dyn_adv_max = eepromBuffer.advance_max_level - 10;
-    } else if (eepromBuffer.advance_max_level > 0 && eepromBuffer.advance_max_level < 10) {
-        dyn_adv_max = eepromBuffer.advance_max_level;
-    } else {
-        // Auto-calculate optimal advance ceiling based on motor physics:
-        // Large pancake motors (>= 28 poles, e.g. MN501 300Kv/240Kv): optimal ceiling is 20-22 deg (level 22-24, delta ~10).
-        // Medium motors (<= 24 poles, e.g. V4006 740Kv): optimal ceiling is 24-26 deg (level 26-28, delta ~12).
-        uint8_t delta_adv = (poles >= 28) ? 10 : ((poles >= 20 || eff_kv >= 600) ? 12 : 10);
-        dyn_adv_max = dyn_adv_base + delta_adv;
-    }
-
-    // Safe ceiling clamp based on motor pole count:
-    // For 28-pole motors (MN501 300Kv/240Kv): never exceed 26 (24.375 deg) to prevent demag desync and Id reactive heating.
-    // For <= 24-pole motors (V4006 740Kv): clamp to 28 (26.25 deg) to keep waitTime > 15 ticks.
-    uint8_t max_safe_ceiling = (poles >= 28) ? 26 : 28;
-    if (dyn_adv_max > max_safe_ceiling) {
-        dyn_adv_max = max_safe_ceiling;
-    }
-    if (dyn_adv_max < dyn_adv_base) {
-        dyn_adv_max = dyn_adv_base;
-    }
-    auto_advance_level = dyn_adv_base;
-
-    // 5. Ramp start RPM (below which advance stays at base)
-    if (eepromBuffer.auto_advance_min_rpm_div_100 > 0) {
-        dyn_adv_rpm_start = (uint32_t)eepromBuffer.auto_advance_min_rpm_div_100 * 100;
-    } else if (governor_enabled && (eepromBuffer.can.governor.rpm_mode_and_min & 0x80)) {
-        dyn_adv_rpm_start = (uint32_t)(eepromBuffer.can.governor.rpm_mode_and_min & 0x7F) * 100;
-    } else {
-        // Auto: ~15% of nominal operating speed or KV * 1.5
-        dyn_adv_rpm_start = (eff_kv * 3) / 2;
-        if (dyn_adv_rpm_start < 600) dyn_adv_rpm_start = 600;
-        if (dyn_adv_rpm_start > 2500) dyn_adv_rpm_start = 2500;
-    }
-
-    // 6. Ramp end RPM (at or above which advance reaches max)
-    if (eepromBuffer.auto_advance_max_rpm_div_100 > 0) {
-        dyn_adv_rpm_end = (uint32_t)eepromBuffer.auto_advance_max_rpm_div_100 * 100;
-    } else if (governor_enabled && (eepromBuffer.can.governor.rpm_mode_and_min & 0x80)) {
-        dyn_adv_rpm_end = (uint32_t)eepromBuffer.can.governor.rpm_max_div_100 * 100;
-    } else {
-        // Auto: Scale with 6S nominal voltage (22.2V): ~KV * 22V * 0.85
-        dyn_adv_rpm_end = (eff_kv * 22 * 85) / 100;
-        if (dyn_adv_rpm_end < dyn_adv_rpm_start + 1500) {
-            dyn_adv_rpm_end = dyn_adv_rpm_start + 3500;
-        }
-        if (dyn_adv_rpm_end > 15000) dyn_adv_rpm_end = 15000;
-    }
-
-    if (dyn_adv_rpm_end <= dyn_adv_rpm_start) {
-        dyn_adv_rpm_end = dyn_adv_rpm_start + 1000;
-    }
 }
 
 void loadEEpromSettings()
@@ -953,6 +874,44 @@ void loadEEpromSettings()
     update_dynamic_advance_params();
 }
 
+void update_dynamic_advance_params(void)
+{
+    uint8_t poles = eepromBuffer.motor_poles;
+    if (poles < 2 || (poles & 1) != 0) {
+        poles = 24;
+    }
+    uint8_t pole_pairs = poles / 2;
+
+    dyn_adv_base = (temp_advance >= 10 && temp_advance <= 22) ? temp_advance : 13;
+    if (eepromBuffer.advance_max_level >= 10 && eepromBuffer.advance_max_level <= 42) {
+        dyn_adv_max = eepromBuffer.advance_max_level - 10;
+    } else if (eepromBuffer.advance_max_level > 0 && eepromBuffer.advance_max_level < 10) {
+        dyn_adv_max = eepromBuffer.advance_max_level;
+    } else {
+        dyn_adv_max = 22; // Safe 20.6 deg max for smooth, non-screeching operation
+    }
+    if (dyn_adv_max > 24) dyn_adv_max = 24;
+    if (dyn_adv_max < dyn_adv_base) dyn_adv_max = dyn_adv_base;
+
+    uint32_t eff_kv = (motor_kv >= 50) ? motor_kv : 740;
+
+    if (eepromBuffer.auto_advance_min_rpm_div_100 > 0) {
+        dyn_adv_rpm_start = ((uint32_t)eepromBuffer.auto_advance_min_rpm_div_100 * 10 * pole_pairs);
+    } else {
+        dyn_adv_rpm_start = (800 * pole_pairs) / 10; // ~96 for 24P, ~112 for 28P
+    }
+    if (dyn_adv_rpm_start < 80) dyn_adv_rpm_start = 80;
+
+    if (eepromBuffer.auto_advance_max_rpm_div_100 > 0) {
+        dyn_adv_rpm_end = ((uint32_t)eepromBuffer.auto_advance_max_rpm_div_100 * 10 * pole_pairs);
+    } else if (governor_enabled && (eepromBuffer.can.governor.rpm_mode_and_min & 0x80)) {
+        dyn_adv_rpm_end = ((uint32_t)eepromBuffer.can.governor.rpm_max_div_100 * 10 * pole_pairs);
+    } else {
+        dyn_adv_rpm_end = (((eff_kv * 22 * 85) / 100) * pole_pairs) / 10;
+    }
+    if (dyn_adv_rpm_end < dyn_adv_rpm_start + 200) dyn_adv_rpm_end = dyn_adv_rpm_start + 400;
+}
+
 void saveEEpromSettings()
 {
     save_flash_nolib(eepromBuffer.buffer, sizeof(eepromBuffer.buffer), eeprom_address);
@@ -1038,7 +997,7 @@ void commutate()
     __enable_irq();
     changeCompInput();
 #ifndef NO_POLLING_START
-    uint32_t polling_revert = governor_enabled ? 8000 : (polling_mode_changeover + 500);
+    uint32_t polling_revert = governor_enabled ? 2200 : (polling_mode_changeover + 500);
 	if (average_interval > polling_revert) {
       old_routine = 1;
    }
@@ -1070,11 +1029,7 @@ void PeriodElapsedCallback()
 	} else {
 	  advance = (commutation_interval * auto_advance_level) >> 6; // 60 divde 64 0.9375 degree increments
     }
-    if (((uint32_t)advance + MIN_COMMUTATION_WAIT_TICKS) >= (commutation_interval >> 1)) {
-        waitTime = MIN_COMMUTATION_WAIT_TICKS;
-    } else {
-        waitTime = (commutation_interval >> 1) - advance;
-    }
+    waitTime = (commutation_interval >> 1) - advance;
     if (!old_routine) {
         enableCompInterrupts(); // enable comp interrupt
     }
@@ -1347,28 +1302,13 @@ void setInput()
                     // Linear Throttle-to-RPM Mapping: 0% = r_min (1000 RPM), 100% = r_max (6000 RPM)
                     uint32_t target_rpm_val = r_min + ((throttle_in * (r_max - r_min)) / throttle_range);
 
-                    bool failsafe_trip = rpm_governor_failsafe_update(
-                        &governor_failsafe,
-                        zero_crosses,
-                        adjusted_input,
-                        governor_erpm_loss_ms,
-                        governor_enabled,
-                        running
-                    );
-                    if (failsafe_trip || governor_failsafe.latched_fault) {
-                        input = 0;
-                        input_override = 0;
-                        duty_cycle = 0;
-                        return;
-                    }
-
                     if (adjusted_input < 47) {
                         input = 0;
                         speedPid.error = 0;
                         input_override = 0;
                         ramped_target_rpm = r_min;
                     } else {
-                        if (!running || zero_crosses < 10) {
+                        if (!running || zero_crosses <= 20) {
                             ramped_target_rpm = r_min;
                         } else {
                             // Dual-Zone Adaptive Slew Rate Limiter (User requirement: 0-25% gentle response & anti-saturation):
@@ -1376,16 +1316,13 @@ void setInput()
                             // Gentle response (~2,400 RPM/s) for high control quality, anti-saturation & zero screech.
                             // Zone 2: >25% ga (2250 - 6000 RPM):
                             // Agile fast response (~14,000 RPM/s) for VTOL flight dynamics.
-                            uint32_t low_zone_boundary = r_min + ((r_max - r_min) >> 2); // 25% ga threshold (~2100 RPM)
-                            uint32_t max_rpm_step = 50; // Zone 2 (>25%): Agile fast response (~20,000 RPM/s at 400Hz)
-                            if (governor_slew_div_250 > 0) {
-                                if (ramped_target_rpm <= low_zone_boundary) {
-                                    max_rpm_step = (governor_slew_div_250 > 25) ? 25 : (uint32_t)governor_slew_div_250;
-                                } else {
-                                    max_rpm_step = (uint32_t)governor_slew_div_250;
-                                }
-                            } else if (ramped_target_rpm <= low_zone_boundary) {
-                                max_rpm_step = 25; // Zone 1 (<=25%): Gentle low-zone response (at 50Hz DShot: 1250 RPM/s, smooth mướt mà)
+                            uint32_t low_zone_boundary = r_min + ((r_max - r_min) >> 2); // 25% ga threshold
+                            uint32_t max_rpm_step = 35; // Default ~14,000 RPM/s in high range
+                            if (governor_slew_div_250 > 0 && governor_slew_div_250 < 35) {
+                                max_rpm_step = (uint32_t)governor_slew_div_250;
+                            }
+                            if (ramped_target_rpm <= low_zone_boundary) {
+                                max_rpm_step = 6; // 6 * 400Hz = 2400 RPM/s (gentle anti-saturation in 0-25% zone)
                             }
                             if (ramped_target_rpm < target_rpm_val) {
                                 ramped_target_rpm += max_rpm_step;
@@ -1401,7 +1338,7 @@ void setInput()
                             }
                         }
 
-                        target_e_com_time = rpm_governor_calc_com_time_u16(ramped_target_rpm, eepromBuffer.motor_poles);
+                        target_e_com_time = 60000000UL / ramped_target_rpm / (eepromBuffer.motor_poles / 2);
 
                         // Feedforward: calculate expected duty from motor physics using ramped_target_rpm
                         int32_t ff_input = 48;
@@ -1422,7 +1359,7 @@ void setInput()
                         }
                         uint16_t freq_breakaway = (uint16_t)((pwm_f * 285U) / 24U);
 
-                        if (!running || zero_crosses < 10) {
+                        if (!running || zero_crosses <= 20) {
                             int32_t start_input = adjusted_input;
                             if (governor_enabled) {
                                 if (start_input < freq_breakaway) {
@@ -1456,22 +1393,11 @@ void setInput()
                                 uint32_t act_rpm = 60000000UL / (uint32_t)e_com_time / (eepromBuffer.motor_poles / 2);
                                 uint32_t act_duty = act_rpm * 200000UL / ((uint32_t)motor_kv * (uint32_t)battery_voltage);
                                 uint32_t low_boundary = r_min + ((r_max - r_min) >> 2);
-                                uint32_t lead_allowance = 200;
+                                uint32_t lead_allowance = 400;
                                 if (ramped_target_rpm > low_boundary && r_max > low_boundary) {
-                                    lead_allowance = 200 + ((ramped_target_rpm - low_boundary) * 350UL) / (r_max - low_boundary);
-                                }
-                                if (lead_allowance > 550) {
-                                    lead_allowance = 550;
+                                    lead_allowance = 400 + ((ramped_target_rpm - low_boundary) * 350UL) / (r_max - low_boundary);
                                 }
                                 int32_t max_lead_override = (int32_t)(47 + act_duty + lead_allowance) * 10000;
-                                // Safety floor: Never choke below the slew-limited feedforward target duty or breakaway duty
-                                int32_t min_safe_lead = ff_override;
-                                if (min_safe_lead < (int32_t)(freq_breakaway + 30) * 10000) {
-                                    min_safe_lead = (int32_t)(freq_breakaway + 30) * 10000;
-                                }
-                                if (max_lead_override < min_safe_lead) {
-                                    max_lead_override = min_safe_lead;
-                                }
                                 if (max_lead_override > (2047 * 10000)) max_lead_override = 2047 * 10000;
                                 if (input_override > max_lead_override) {
                                     input_override = max_lead_override;
@@ -1777,7 +1703,7 @@ void tenKhzRoutine()
                     stall_protection_adjust = 0;
                 }
             }
-            if (use_speed_control_loop && running && (zero_crosses >= 10)) {
+            if (use_speed_control_loop && running && (zero_crosses > 20)) {
                 int32_t pid_out = doPidCalculations(&speedPid, e_com_time, target_e_com_time);
                 int32_t current_ceiling = (int32_t)eepromBuffer.limits.current * 2 * 100; // e.g. 24A = 2400
                 if (current_ceiling == 0 || current_ceiling > 5000) current_ceiling = 2400;
@@ -1806,7 +1732,7 @@ void tenKhzRoutine()
                 if (zero_crosses < 100) {
                     speedPid.integral = 0;
                 }
-            } else if (use_speed_control_loop && running && (zero_crosses < 10)) {
+            } else if (use_speed_control_loop && running && (zero_crosses <= 20)) {
                 if (!governor_enabled) {
                     input_override = (int32_t)adjusted_input * 10000;
                     last_ff_override = input_override;
@@ -1978,16 +1904,8 @@ void zcfoundroutine()
     thiszctime = INTERVAL_TIMER_COUNT;
     SET_INTERVAL_TIMER_COUNT(0);
     commutation_interval = (thiszctime + (3 * commutation_interval)) / 4;
-    if (!eepromBuffer.auto_advance) {
-        advance = (temp_advance * commutation_interval) >> 6;
-    } else {
-        advance = (auto_advance_level * commutation_interval) >> 6;
-    }
-    if (((uint32_t)advance + MIN_COMMUTATION_WAIT_TICKS) >= (commutation_interval >> 1)) {
-        waitTime = MIN_COMMUTATION_WAIT_TICKS;
-    } else {
-        waitTime = commutation_interval / 2 - advance;
-    }
+    advance = (temp_advance * commutation_interval) >> 6; //   7.5 degree increments
+    waitTime = commutation_interval / 2 - advance;
     uint32_t eff_wait = (zero_crosses >= 5) ? waitTime : (waitTime * zero_crosses) / 5;
     while ((INTERVAL_TIMER_COUNT) < eff_wait);
 #ifdef MCU_GDE23
@@ -2017,8 +1935,8 @@ void zcfoundroutine()
         }
 #else
     if (governor_enabled || eepromBuffer.stall_protection || eepromBuffer.rc_car_reverse) {
-        uint32_t changeover_thresh = governor_enabled ? 6000 : 2000;
-        if (zero_crosses >= (governor_enabled ? 30 : 50) && commutation_interval <= changeover_thresh) {
+        uint32_t changeover_thresh = governor_enabled ? 1500 : 2000;
+        if (zero_crosses >= 50 && commutation_interval <= changeover_thresh) {
             old_routine = 0;
             enableCompInterrupts(); // enable interrupt
         }
@@ -2631,23 +2549,12 @@ if(zero_crosses < 5){
             }
 
             if (eepromBuffer.auto_advance) {
-                // Dynamic RPM-Tracking Auto-Advance:
-                // Auto-scaled with rotor mechanical RPM derived from e_com_time and motor poles.
-                // Clamped to [dyn_adv_base, dyn_adv_max] over speed range [dyn_adv_rpm_start, dyn_adv_rpm_end].
-                // Configured by Motor KV, Poles, Base Advance, and optional manual EEPROM thresholds.
-                if (running && zero_crosses >= 10 && e_com_time > 0 && dyn_adv_pole_pairs > 0) {
-                    uint32_t current_rpm = 60000000UL / (uint32_t)e_com_time / dyn_adv_pole_pairs;
-                    if (current_rpm <= dyn_adv_rpm_start) {
-                        auto_advance_level = dyn_adv_base;
-                    } else if (current_rpm >= dyn_adv_rpm_end) {
-                        auto_advance_level = dyn_adv_max;
-                    } else {
-                        auto_advance_level = dyn_adv_base + 
-                            ((uint32_t)(current_rpm - dyn_adv_rpm_start) * (dyn_adv_max - dyn_adv_base)) / 
-                            (dyn_adv_rpm_end - dyn_adv_rpm_start);
-                    }
-                } else {
+                if (k_erpm < dyn_adv_rpm_start) {
                     auto_advance_level = dyn_adv_base;
+                } else if (k_erpm > dyn_adv_rpm_end) {
+                    auto_advance_level = dyn_adv_max;
+                } else {
+                    auto_advance_level = map(k_erpm, dyn_adv_rpm_start, dyn_adv_rpm_end, dyn_adv_base, dyn_adv_max);
                 }
             }
 
