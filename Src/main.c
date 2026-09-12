@@ -576,6 +576,7 @@ volatile uint16_t thiszctime;
 volatile uint16_t duty_cycle = 0;
 char step = 1;
 volatile uint32_t commutation_interval = 12500;
+#define MIN_COMMUTATION_WAIT_TICKS 8U // 4.0us safe minimum timer margin to prevent waitTime underflow/collision
 volatile uint16_t waitTime = 0;
 uint16_t signaltimeout = 0;
 uint8_t ubAnalogWatchdogStatus = RESET;
@@ -684,8 +685,8 @@ void update_dynamic_advance_params(void)
 
     // 2. Base advance (low RPM advance angle)
     dyn_adv_base = temp_advance; // 0..32 in 0.9375 deg steps
-    if (dyn_adv_base > 30) {
-        dyn_adv_base = 30; // 28.125 deg safe ceiling
+    if (dyn_adv_base > 26) {
+        dyn_adv_base = 26; // Safe base advance ceiling (24.375 deg)
     }
 
     // 3. Effective Motor KV
@@ -700,19 +701,24 @@ void update_dynamic_advance_params(void)
     } else if (eepromBuffer.advance_max_level > 0 && eepromBuffer.advance_max_level < 10) {
         dyn_adv_max = eepromBuffer.advance_max_level;
     } else {
-        // Auto-calculate optimal advance ceiling:
-        // Larger poles (>= 20) or higher KV (>= 600) need higher advance (~28-30) for phase lag compensation
-        uint8_t delta_adv = (poles >= 20 || eff_kv >= 600) ? 12 : 10;
+        // Auto-calculate optimal advance ceiling based on motor physics:
+        // Large pancake motors (>= 28 poles, e.g. MN501 300Kv/240Kv): optimal ceiling is 20-22 deg (level 22-24, delta ~10).
+        // Medium motors (<= 24 poles, e.g. V4006 740Kv): optimal ceiling is 24-26 deg (level 26-28, delta ~12).
+        uint8_t delta_adv = (poles >= 28) ? 10 : ((poles >= 20 || eff_kv >= 600) ? 12 : 10);
         dyn_adv_max = dyn_adv_base + delta_adv;
     }
 
-    // Safe ceiling clamp: never exceed 30 (28.125 deg) to prevent waitTime underflow (30/64 = 0.46875 < 0.50)
-    if (dyn_adv_max > 30) {
-        dyn_adv_max = 30;
+    // Safe ceiling clamp based on motor pole count:
+    // For 28-pole motors (MN501 300Kv/240Kv): never exceed 26 (24.375 deg) to prevent demag desync and Id reactive heating.
+    // For <= 24-pole motors (V4006 740Kv): clamp to 28 (26.25 deg) to keep waitTime > 15 ticks.
+    uint8_t max_safe_ceiling = (poles >= 28) ? 26 : 28;
+    if (dyn_adv_max > max_safe_ceiling) {
+        dyn_adv_max = max_safe_ceiling;
     }
     if (dyn_adv_max < dyn_adv_base) {
         dyn_adv_max = dyn_adv_base;
     }
+    auto_advance_level = dyn_adv_base;
 
     // 5. Ramp start RPM (below which advance stays at base)
     if (eepromBuffer.auto_advance_min_rpm_div_100 > 0) {
@@ -732,10 +738,10 @@ void update_dynamic_advance_params(void)
     } else if (governor_enabled && (eepromBuffer.can.governor.rpm_mode_and_min & 0x80)) {
         dyn_adv_rpm_end = (uint32_t)eepromBuffer.can.governor.rpm_max_div_100 * 100;
     } else {
-        // Auto: ~KV * 16V * 0.85
-        dyn_adv_rpm_end = (eff_kv * 16 * 85) / 100;
+        // Auto: Scale with 6S nominal voltage (22.2V): ~KV * 22V * 0.85
+        dyn_adv_rpm_end = (eff_kv * 22 * 85) / 100;
         if (dyn_adv_rpm_end < dyn_adv_rpm_start + 1500) {
-            dyn_adv_rpm_end = dyn_adv_rpm_start + 4000;
+            dyn_adv_rpm_end = dyn_adv_rpm_start + 3500;
         }
         if (dyn_adv_rpm_end > 15000) dyn_adv_rpm_end = 15000;
     }
@@ -1064,8 +1070,8 @@ void PeriodElapsedCallback()
 	} else {
 	  advance = (commutation_interval * auto_advance_level) >> 6; // 60 divde 64 0.9375 degree increments
     }
-    if (advance >= (commutation_interval >> 1)) {
-        waitTime = 1;
+    if (((uint32_t)advance + MIN_COMMUTATION_WAIT_TICKS) >= (commutation_interval >> 1)) {
+        waitTime = MIN_COMMUTATION_WAIT_TICKS;
     } else {
         waitTime = (commutation_interval >> 1) - advance;
     }
@@ -1450,12 +1456,12 @@ void setInput()
                                 uint32_t act_rpm = 60000000UL / (uint32_t)e_com_time / (eepromBuffer.motor_poles / 2);
                                 uint32_t act_duty = act_rpm * 200000UL / ((uint32_t)motor_kv * (uint32_t)battery_voltage);
                                 uint32_t low_boundary = r_min + ((r_max - r_min) >> 2);
-                                uint32_t lead_allowance = 100;
+                                uint32_t lead_allowance = 200;
                                 if (ramped_target_rpm > low_boundary && r_max > low_boundary) {
-                                    lead_allowance = 100 + ((ramped_target_rpm - low_boundary) * 50UL) / (r_max - low_boundary);
+                                    lead_allowance = 200 + ((ramped_target_rpm - low_boundary) * 350UL) / (r_max - low_boundary);
                                 }
-                                if (lead_allowance > 150) {
-                                    lead_allowance = 150;
+                                if (lead_allowance > 550) {
+                                    lead_allowance = 550;
                                 }
                                 int32_t max_lead_override = (int32_t)(47 + act_duty + lead_allowance) * 10000;
                                 // Safety floor: Never choke below the slew-limited feedforward target duty or breakaway duty
@@ -1977,8 +1983,8 @@ void zcfoundroutine()
     } else {
         advance = (auto_advance_level * commutation_interval) >> 6;
     }
-    if (advance >= (commutation_interval >> 1)) {
-        waitTime = 1;
+    if (((uint32_t)advance + MIN_COMMUTATION_WAIT_TICKS) >= (commutation_interval >> 1)) {
+        waitTime = MIN_COMMUTATION_WAIT_TICKS;
     } else {
         waitTime = commutation_interval / 2 - advance;
     }
@@ -2629,7 +2635,7 @@ if(zero_crosses < 5){
                 // Auto-scaled with rotor mechanical RPM derived from e_com_time and motor poles.
                 // Clamped to [dyn_adv_base, dyn_adv_max] over speed range [dyn_adv_rpm_start, dyn_adv_rpm_end].
                 // Configured by Motor KV, Poles, Base Advance, and optional manual EEPROM thresholds.
-                if (running && e_com_time > 0 && dyn_adv_pole_pairs > 0) {
+                if (running && zero_crosses >= 10 && e_com_time > 0 && dyn_adv_pole_pairs > 0) {
                     uint32_t current_rpm = 60000000UL / (uint32_t)e_com_time / dyn_adv_pole_pairs;
                     if (current_rpm <= dyn_adv_rpm_start) {
                         auto_advance_level = dyn_adv_base;
