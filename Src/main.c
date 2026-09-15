@@ -896,16 +896,16 @@ void update_dynamic_advance_params(void)
     uint32_t eff_kv = (motor_kv >= 50) ? motor_kv : 740;
 
     if (eepromBuffer.auto_advance_min_rpm_div_100 > 0) {
-        dyn_adv_rpm_start = ((uint32_t)eepromBuffer.auto_advance_min_rpm_div_100 * 10 * pole_pairs);
+        dyn_adv_rpm_start = ((uint32_t)eepromBuffer.auto_advance_min_rpm_div_100 * pole_pairs);
     } else {
         dyn_adv_rpm_start = (800 * pole_pairs) / 10; // ~96 for 24P, ~112 for 28P
     }
     if (dyn_adv_rpm_start < 80) dyn_adv_rpm_start = 80;
 
     if (eepromBuffer.auto_advance_max_rpm_div_100 > 0) {
-        dyn_adv_rpm_end = ((uint32_t)eepromBuffer.auto_advance_max_rpm_div_100 * 10 * pole_pairs);
+        dyn_adv_rpm_end = ((uint32_t)eepromBuffer.auto_advance_max_rpm_div_100 * pole_pairs);
     } else if (governor_enabled && (eepromBuffer.can.governor.rpm_mode_and_min & 0x80)) {
-        dyn_adv_rpm_end = ((uint32_t)eepromBuffer.can.governor.rpm_max_div_100 * 10 * pole_pairs);
+        dyn_adv_rpm_end = ((uint32_t)eepromBuffer.can.governor.rpm_max_div_100 * pole_pairs);
     } else {
         dyn_adv_rpm_end = (((eff_kv * 22 * 85) / 100) * pole_pairs) / 10;
     }
@@ -1045,31 +1045,24 @@ void PeriodElapsedCallback()
  */
 void interruptRoutine()
 {
-    if (INTERVAL_TIMER_COUNT < 200) {
-        return; // reject PWM noise spike (<8333 RPM on 24P)
-    }
-    stuckcounter++;
-    if (stuckcounter > 50) {
-        maskPhaseInterrupts();
-        old_routine = 1;
-        zero_crosses = 0;
-        stuckcounter = 0;
+    if (INTERVAL_TIMER_COUNT < (commutation_interval >> 3)) {
         return;
     }
-        for (int i = 0; i < filter_level; i++) {
+    for (int i = 0; i < filter_level; i++) {
 #if defined(MCU_F031) || defined(MCU_G031)
-            if (((current_GPIO_PORT->IDR & current_GPIO_PIN) == !(rising))) {
+        if (((current_GPIO_PORT->IDR & current_GPIO_PIN) == !(rising))) {
 #else
-            if (getCompOutputLevel() == rising) {
+        if (getCompOutputLevel() == rising) {
 #endif
-                return;
-            }
+            return;
         }
+    }
     __disable_irq();
     maskPhaseInterrupts();
     lastzctime = thiszctime;
     thiszctime = INTERVAL_TIMER_COUNT;  
     SET_INTERVAL_TIMER_COUNT(0);
+    stuckcounter = 0;
     SET_AND_ENABLE_COM_INT(waitTime+1); // enable COM_TIMER interrupt
     __enable_irq();
 }
@@ -1082,6 +1075,7 @@ void startMotor()
         running = 1;
         old_routine = 1;
         zero_crosses = 0;
+        desync_happened = 0;
         maskPhaseInterrupts();
         commutate();
     }
@@ -1398,6 +1392,8 @@ void setInput()
                                     lead_allowance = 400 + ((ramped_target_rpm - low_boundary) * 350UL) / (r_max - low_boundary);
                                 }
                                 int32_t max_lead_override = (int32_t)(47 + act_duty + lead_allowance) * 10000;
+                                int32_t min_safe_lead = ff_override;
+                                if (max_lead_override < min_safe_lead) max_lead_override = min_safe_lead;
                                 if (max_lead_override > (2047 * 10000)) max_lead_override = 2047 * 10000;
                                 if (input_override > max_lead_override) {
                                     input_override = max_lead_override;
@@ -2335,7 +2331,7 @@ if(zero_crosses < 5){
             if ((getAbsDif(last_average_interval, average_interval) > average_interval >> 1) && (average_interval < 2000)) { // throttle resitricted before zc 20.
                 zero_crosses = 0;
                 desync_happened++;
-                if ((!eepromBuffer.bi_direction && (input > 47)) || commutation_interval > 1000) {
+                if (((!eepromBuffer.bi_direction && (input > 47)) || commutation_interval > 1000) && (desync_happened > 3)) {
                     running = 0;
                 }
                 old_routine = 1;
@@ -2343,6 +2339,8 @@ if(zero_crosses < 5){
                     average_interval = 5000;
                 }
                 last_duty_cycle = min_startup_duty / 2;
+            } else {
+                desync_happened = 0;
             }
             desync_check = 0;
             //	}
