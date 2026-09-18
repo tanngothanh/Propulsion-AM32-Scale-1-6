@@ -2441,12 +2441,13 @@ if(zero_crosses < 5){
 #else
             battery_voltage = ((7 * battery_voltage) + ((ADC_raw_volts * 3300 / 4095 * VOLTAGE_DIVIDER) / 100)) >> 3;
             smoothed_raw_current = getSmoothedCurrent();
-            static uint32_t calibrated_current_offset = ((uint32_t)CURRENT_OFFSET * 100);
+            // Idle offset set to 0.2A (20 centi-Amperes, 1 unit = 10mA)
+            static uint32_t calibrated_current_offset = ((uint32_t)CURRENT_OFFSET * 100) - ((uint32_t)20 * MILLIVOLT_PER_AMP);
             static uint8_t current_calibrated = 0;
             static uint16_t current_warmup_samples = 0;
             static uint16_t current_cal_samples = 0;
             static uint32_t current_cal_sum = 0;
-            if (!armed && !running && !current_calibrated) {
+            if (!running && !current_calibrated) {
                 if (current_warmup_samples < 500) {
                     current_warmup_samples++;
                 } else {
@@ -2454,16 +2455,16 @@ if(zero_crosses < 5){
                     current_cal_samples++;
                     if (current_cal_samples >= 64) {
                         uint32_t measured_offset = current_cal_sum >> 6;
-                        if (measured_offset >= ((uint32_t)CURRENT_OFFSET * 100 - 10000) &&
-                            measured_offset <= ((uint32_t)CURRENT_OFFSET * 100 + 10000)) {
-                            calibrated_current_offset = measured_offset;
+                        // Accept physical resting op-amp offset between 300 mV (30000) and 750 mV (75000)
+                        if (measured_offset >= 30000U && measured_offset <= 75000U) {
+                            calibrated_current_offset = measured_offset - ((uint32_t)20 * MILLIVOLT_PER_AMP);
                         }
                         current_calibrated = 1;
                     }
                 }
             }
             int32_t raw_current_val = (((int32_t)smoothed_raw_current * 3300 / 41) - (int32_t)calibrated_current_offset) / (MILLIVOLT_PER_AMP);
-            actual_current = (raw_current_val > 0) ? (int16_t)raw_current_val : 0;
+            actual_current = (raw_current_val >= 20) ? (int16_t)raw_current_val : 20;
 #endif             
             if (eepromBuffer.low_voltage_cut_off == 1) {  
                 if (battery_voltage < (cell_count * low_cell_volt_cutoff)) {
