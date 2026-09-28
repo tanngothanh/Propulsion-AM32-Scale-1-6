@@ -1332,7 +1332,8 @@ void setInput()
                     2047, 160, 2047);
             }
         } else {
-            if (rpm_governor_failsafe_update(&governor_failsafe, zero_crosses, adjusted_input, governor_erpm_loss_ms, governor_enabled, running)) {
+            bool closed_loop_running = running && !old_routine && (zero_crosses >= 50);
+            if (rpm_governor_failsafe_update(&governor_failsafe, zero_crosses, adjusted_input, governor_erpm_loss_ms, governor_enabled, closed_loop_running)) {
                 adjusted_input = 0;
             }
             if (use_speed_control_loop) {
