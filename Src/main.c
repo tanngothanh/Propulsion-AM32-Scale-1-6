@@ -253,6 +253,8 @@ an settings option)
 
 void zcfoundroutine(void);
 
+#define MIN_COMMUTATION_WAIT_TICKS 8U
+
 // firmware build options !! fixed speed and duty cycle modes are not to be used
 // with sinusoidal startup !!
 
@@ -333,9 +335,15 @@ uint16_t enter_sine_angle = 180;
 char do_once_sinemode = 0;
 uint8_t auto_advance_level;
 uint8_t dyn_adv_base = 13;
-uint8_t dyn_adv_max = 22;
-uint32_t dyn_adv_rpm_start = 120;
-uint32_t dyn_adv_rpm_end = 720;
+uint8_t dyn_adv_max = 24;
+uint32_t dyn_adv_rpm_start = 1500;
+uint32_t dyn_adv_rpm_end = 6000;
+uint16_t dyn_adv_m_start = 913;
+uint16_t dyn_adv_m_end = 3652;
+uint16_t dyn_adv_m_span = 2739;
+uint32_t dyn_adv_m_span_sq = 7502121UL;
+uint8_t  dyn_adv_delta = 11;
+uint32_t dyn_adv_v_nom_cv = 2220;
 void update_dynamic_advance_params(void);
 volatile uint8_t zero_throttle_brake_active;
 volatile uint8_t temp_comp_pwm;
@@ -622,7 +630,7 @@ static int32_t last_ff_override = 0;
 static void applyGovernorConfig(void)
 {
     governor_enabled = 0;
-    governor_erpm_loss_ms = 0;
+    governor_erpm_loss_ms = eepromBuffer.can.governor.erpm_loss_ms;
     rpm_governor_failsafe_reset(&governor_failsafe, zero_crosses);
     // ponytail: governor requires forward-only DShot; sine-start/stall/BI must be off.
     // Upgrade path: lift restriction after bench validation of sine/governor handover.
@@ -878,38 +886,73 @@ void update_dynamic_advance_params(void)
 {
     uint8_t poles = eepromBuffer.motor_poles;
     if (poles < 2 || (poles & 1) != 0) {
-        poles = 24;
+        poles = 14;
     }
     uint8_t pole_pairs = poles / 2;
+    (void)pole_pairs;
 
-    dyn_adv_base = (temp_advance >= 10 && temp_advance <= 22) ? temp_advance : 13;
+    dyn_adv_base = temp_advance;
+    if (dyn_adv_base > 26) {
+        dyn_adv_base = 26;
+    }
+
+    uint32_t eff_kv = (motor_kv >= 50) ? motor_kv : 740;
+
     if (eepromBuffer.advance_max_level >= 10 && eepromBuffer.advance_max_level <= 42) {
         dyn_adv_max = eepromBuffer.advance_max_level - 10;
     } else if (eepromBuffer.advance_max_level > 0 && eepromBuffer.advance_max_level < 10) {
         dyn_adv_max = eepromBuffer.advance_max_level;
     } else {
-        dyn_adv_max = 22; // Safe 20.6 deg max for smooth, non-screeching operation
+        uint8_t delta_adv = (poles >= 28) ? 10 : ((poles >= 20 || eff_kv >= 600) ? 12 : 10);
+        dyn_adv_max = dyn_adv_base + delta_adv;
     }
-    if (dyn_adv_max > 24) dyn_adv_max = 24;
+    uint8_t max_safe_ceiling = (poles >= 28) ? 26 : 28;
+    if (dyn_adv_max > max_safe_ceiling) dyn_adv_max = max_safe_ceiling;
     if (dyn_adv_max < dyn_adv_base) dyn_adv_max = dyn_adv_base;
+    dyn_adv_delta = dyn_adv_max - dyn_adv_base;
 
-    uint32_t eff_kv = (motor_kv >= 50) ? motor_kv : 740;
+    uint32_t gov_min_rpm = (governor_enabled && (eepromBuffer.can.governor.rpm_mode_and_min & 0x80))
+                           ? ((uint32_t)(eepromBuffer.can.governor.rpm_mode_and_min & 0x7F) * 100UL) : 0;
+    uint32_t gov_max_rpm = (governor_enabled && (eepromBuffer.can.governor.rpm_mode_and_min & 0x80))
+                           ? ((uint32_t)eepromBuffer.can.governor.rpm_max_div_100 * 100UL) : 0;
 
     if (eepromBuffer.auto_advance_min_rpm_div_100 > 0) {
-        dyn_adv_rpm_start = ((uint32_t)eepromBuffer.auto_advance_min_rpm_div_100 * pole_pairs);
+        dyn_adv_rpm_start = (uint32_t)eepromBuffer.auto_advance_min_rpm_div_100 * 100UL;
+    } else if (gov_min_rpm > 0) {
+        dyn_adv_rpm_start = gov_min_rpm;
     } else {
-        dyn_adv_rpm_start = (800 * pole_pairs) / 10; // ~96 for 24P, ~112 for 28P
+        dyn_adv_rpm_start = (eff_kv * 3UL) / 2UL;
+        if (dyn_adv_rpm_start < 600UL) dyn_adv_rpm_start = 600UL;
+        if (dyn_adv_rpm_start > 2500UL) dyn_adv_rpm_start = 2500UL;
     }
-    if (dyn_adv_rpm_start < 80) dyn_adv_rpm_start = 80;
 
     if (eepromBuffer.auto_advance_max_rpm_div_100 > 0) {
-        dyn_adv_rpm_end = ((uint32_t)eepromBuffer.auto_advance_max_rpm_div_100 * pole_pairs);
-    } else if (governor_enabled && (eepromBuffer.can.governor.rpm_mode_and_min & 0x80)) {
-        dyn_adv_rpm_end = ((uint32_t)eepromBuffer.can.governor.rpm_max_div_100 * pole_pairs);
+        dyn_adv_rpm_end = (uint32_t)eepromBuffer.auto_advance_max_rpm_div_100 * 100UL;
+    } else if (gov_max_rpm > 0) {
+        dyn_adv_rpm_end = gov_max_rpm;
     } else {
-        dyn_adv_rpm_end = (((eff_kv * 22 * 85) / 100) * pole_pairs) / 10;
+        dyn_adv_rpm_end = (eff_kv * 22UL * 85UL) / 100UL;
+        if (dyn_adv_rpm_end < dyn_adv_rpm_start + 1500UL) dyn_adv_rpm_end = dyn_adv_rpm_start + 3500UL;
+        if (dyn_adv_rpm_end > 15000UL) dyn_adv_rpm_end = 15000UL;
     }
-    if (dyn_adv_rpm_end < dyn_adv_rpm_start + 200) dyn_adv_rpm_end = dyn_adv_rpm_start + 400;
+    if (dyn_adv_rpm_end <= dyn_adv_rpm_start) {
+        dyn_adv_rpm_end = dyn_adv_rpm_start + 1000UL;
+    }
+
+    // Auto-derive modulation index points from nominal battery voltage (3.7V/cell)
+    dyn_adv_v_nom_cv = (cell_count >= 2 && cell_count <= 14) ? ((uint32_t)cell_count * 370UL) : 2220UL;
+    uint32_t denom_nom = (eff_kv * dyn_adv_v_nom_cv) / 100UL;
+    if (denom_nom > 0) {
+        dyn_adv_m_start = (uint16_t)((dyn_adv_rpm_start * 10000UL) / denom_nom);
+        dyn_adv_m_end   = (uint16_t)((dyn_adv_rpm_end * 10000UL) / denom_nom);
+        if (dyn_adv_m_end <= dyn_adv_m_start) {
+            dyn_adv_m_end = dyn_adv_m_start + 1000;
+        }
+        dyn_adv_m_span = dyn_adv_m_end - dyn_adv_m_start;
+        dyn_adv_m_span_sq = (uint32_t)dyn_adv_m_span * (uint32_t)dyn_adv_m_span;
+    }
+
+    auto_advance_level = dyn_adv_base;
 }
 
 void saveEEpromSettings()
@@ -1024,12 +1067,16 @@ void PeriodElapsedCallback()
     DISABLE_COM_TIMER_INT(); // disable interrupt
     commutate();
     commutation_interval = ((commutation_interval)+((lastzctime + thiszctime) >> 1))>>1;
-  	if (!eepromBuffer.auto_advance) {
-	  advance = (commutation_interval * temp_advance) >> 6; // 60 divde 64 0.9375 degree increments
-	} else {
-	  advance = (commutation_interval * auto_advance_level) >> 6; // 60 divde 64 0.9375 degree increments
+    if (!eepromBuffer.auto_advance) {
+        advance = (commutation_interval * temp_advance) >> 6; // 60 divde 64 0.9375 degree increments
+    } else {
+        advance = (commutation_interval * auto_advance_level) >> 6; // 60 divde 64 0.9375 degree increments
     }
-    waitTime = (commutation_interval >> 1) - advance;
+    if (((uint32_t)advance + MIN_COMMUTATION_WAIT_TICKS) >= (commutation_interval >> 1)) {
+        waitTime = MIN_COMMUTATION_WAIT_TICKS;
+    } else {
+        waitTime = (commutation_interval >> 1) - advance;
+    }
     if (!old_routine) {
         enableCompInterrupts(); // enable comp interrupt
     }
@@ -1285,6 +1332,9 @@ void setInput()
                     2047, 160, 2047);
             }
         } else {
+            if (rpm_governor_failsafe_update(&governor_failsafe, zero_crosses, adjusted_input, governor_erpm_loss_ms, governor_enabled, running)) {
+                adjusted_input = 0;
+            }
             if (use_speed_control_loop) {
                 if (drive_by_rpm) {
                     uint32_t r_min = governor_enabled ? governor_rpm_min : MINIMUM_RPM_SPEED_CONTROL;
@@ -1332,7 +1382,7 @@ void setInput()
                             }
                         }
 
-                        target_e_com_time = 60000000UL / ramped_target_rpm / (eepromBuffer.motor_poles / 2);
+                        target_e_com_time = rpm_governor_calc_com_time_u16(ramped_target_rpm, eepromBuffer.motor_poles);
 
                         // Feedforward: calculate expected duty from motor physics using ramped_target_rpm
                         int32_t ff_input = 48;
@@ -1380,16 +1430,16 @@ void setInput()
 
                             // Progressive Dynamic Lead Clamp:
                             // Zone 1 (0-25% throttle, <= low_boundary): +400 counts lead prevents startup saturation/screech/jerk.
-                            // Zone 2 (>25% throttle): progressive lead expands smoothly up to +750 counts (~37.5% duty lead).
-                            // This allows sufficient voltage to reach 5500 RPM under load while strictly preventing the
-                            // unconstrained 2047-count (100% duty) voltage slam that causes 29A acceleration spikes!
+                            // Zone 2 (>25% throttle): progressive lead expands smoothly up to +1550 counts (full duty headroom at 6000 RPM).
+                            // This allows sufficient voltage to reach 6000 RPM under heavy propeller load while strictly preventing
+                            // low-speed voltage slam and current spikes!
                             if (battery_voltage > 100 && motor_kv > 0 && e_com_time > 0) {
                                 uint32_t act_rpm = 60000000UL / (uint32_t)e_com_time / (eepromBuffer.motor_poles / 2);
                                 uint32_t act_duty = act_rpm * 200000UL / ((uint32_t)motor_kv * (uint32_t)battery_voltage);
                                 uint32_t low_boundary = r_min + ((r_max - r_min) >> 2);
                                 uint32_t lead_allowance = 400;
                                 if (ramped_target_rpm > low_boundary && r_max > low_boundary) {
-                                    lead_allowance = 400 + ((ramped_target_rpm - low_boundary) * 350UL) / (r_max - low_boundary);
+                                    lead_allowance = 400 + ((ramped_target_rpm - low_boundary) * 1150UL) / (r_max - low_boundary);
                                 }
                                 int32_t max_lead_override = (int32_t)(47 + act_duty + lead_allowance) * 10000;
                                 int32_t min_safe_lead = ff_override;
@@ -1901,7 +1951,11 @@ void zcfoundroutine()
     SET_INTERVAL_TIMER_COUNT(0);
     commutation_interval = (thiszctime + (3 * commutation_interval)) / 4;
     advance = (temp_advance * commutation_interval) >> 6; //   7.5 degree increments
-    waitTime = commutation_interval / 2 - advance;
+    if (((uint32_t)advance + MIN_COMMUTATION_WAIT_TICKS) >= (commutation_interval >> 1)) {
+        waitTime = MIN_COMMUTATION_WAIT_TICKS;
+    } else {
+        waitTime = commutation_interval / 2 - advance;
+    }
     uint32_t eff_wait = (zero_crosses >= 5) ? waitTime : (waitTime * zero_crosses) / 5;
     while ((INTERVAL_TIMER_COUNT) < eff_wait);
 #ifdef MCU_GDE23
@@ -2492,8 +2546,53 @@ if(zero_crosses < 5){
               running = 0;
               zero_input_count = 0;
               armed = 0;
-             }
-           
+            }
+
+            // ================================================================
+            // CT-2W1 eVTOL: Unified Voltage-Adaptive & Non-linear MTPA Advance
+            // Synchronous 1kHz control loop (1.0 ms execution period)
+            // ================================================================
+            if (eepromBuffer.auto_advance && running && zero_crosses > 50 && battery_voltage >= 600 && motor_kv >= 50 && e_com_time > 0) {
+                uint8_t poles = (eepromBuffer.motor_poles >= 2 && !(eepromBuffer.motor_poles & 1)) 
+                                ? eepromBuffer.motor_poles : 24;
+                uint32_t pole_pairs = poles >> 1;
+                uint32_t act_rpm = 60000000UL / (uint32_t)e_com_time / pole_pairs;
+
+                // Voltage source: auto_advance == 1 (Live ADC), auto_advance == 2 (Nominal Bench)
+                uint32_t v_calc_cv = (eepromBuffer.auto_advance == 2) ? dyn_adv_v_nom_cv : (uint32_t)battery_voltage;
+                uint32_t denom_live = ((uint32_t)motor_kv * v_calc_cv) / 100UL;
+
+                uint8_t target_adv = dyn_adv_base;
+                if (denom_live > 0) {
+                    uint32_t m_live = (act_rpm * 10000UL) / denom_live;
+
+                    if (m_live > dyn_adv_m_start) {
+                        uint32_t span = m_live - (uint32_t)dyn_adv_m_start;
+                        if (span >= (uint32_t)dyn_adv_m_span) {
+                            target_adv = dyn_adv_max;
+                        } else {
+                            target_adv = dyn_adv_base + (uint8_t)((span * span * (uint32_t)dyn_adv_delta) / dyn_adv_m_span_sq);
+                        }
+                    }
+                }
+
+                if (target_adv > dyn_adv_max) target_adv = dyn_adv_max;
+                if (target_adv > 26) target_adv = 26; // Guard waitTime >= 4 counts
+
+                // Slew-Rate Limiter: +/-1 step (0.9375 deg) per 4 ms (slew rate <= 234.4 deg/s)
+                static uint8_t adv_slew_counter = 0;
+                if (++adv_slew_counter >= 4) {
+                    adv_slew_counter = 0;
+                    if (auto_advance_level < target_adv) {
+                        auto_advance_level++;
+                    } else if (auto_advance_level > target_adv) {
+                        auto_advance_level--;
+                    }
+                }
+            } else {
+                auto_advance_level = dyn_adv_base;
+            }
+
             PROCESS_ADC_FLAG = 0;
 #ifdef USE_ADC_INPUT
             if (ADC_raw_input < 10) {
@@ -2545,16 +2644,6 @@ if(zero_crosses < 5){
             }
             if (commutation_interval < 50) {
               filter_level = 2;
-            }
-
-            if (eepromBuffer.auto_advance) {
-                if (k_erpm < dyn_adv_rpm_start) {
-                    auto_advance_level = dyn_adv_base;
-                } else if (k_erpm > dyn_adv_rpm_end) {
-                    auto_advance_level = dyn_adv_max;
-                } else {
-                    auto_advance_level = map(k_erpm, dyn_adv_rpm_start, dyn_adv_rpm_end, dyn_adv_base, dyn_adv_max);
-                }
             }
 
             /**************** old routine*********************/
