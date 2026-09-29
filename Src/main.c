@@ -619,7 +619,7 @@ int32_t doPidCalculations(struct fastPID* pidnow, int actual, int target)
 
 // CT-UAV RPM governor state (EEPROM v5 block at bytes 184-191)
 uint8_t governor_enabled = 0;
-uint32_t governor_rpm_min = 1000;
+uint32_t governor_rpm_min = 0;
 uint32_t governor_rpm_max = 9000;
 uint32_t governor_rpm_target = 0;
 uint8_t governor_slew_div_250 = 0;
@@ -630,6 +630,38 @@ static int32_t last_ff_override = 0;
 static void applyGovernorConfig(void)
 {
     governor_enabled = 0;
+
+    // Dual-Source Governor Support for 48-byte Bootloaders:
+    // If servo registers (bytes 32..35) have bit 7 set, sync them to can.governor
+    // This allows 4-Way passthrough tools (which only write bytes 0..47) to configure governor!
+    if ((eepromBuffer.servo.low_threshold & 0x80) != 0) {
+        uint8_t s_mx = eepromBuffer.servo.high_threshold;
+        if (s_mx >= 10 && s_mx <= 120) {
+            eepromBuffer.can.governor.rpm_mode_and_min = eepromBuffer.servo.low_threshold;
+            eepromBuffer.can.governor.rpm_max_div_100  = s_mx;
+            if (eepromBuffer.servo.neutral > 0) {
+                eepromBuffer.can.governor.kp_raw = eepromBuffer.servo.neutral; // Kd damping
+            } else if (eepromBuffer.can.governor.kp_raw == 0xFF) {
+                eepromBuffer.can.governor.kp_raw = 60;
+            }
+            if (eepromBuffer.servo.dead_band > 0) {
+                eepromBuffer.can.governor.ki_raw = eepromBuffer.servo.dead_band; // Kp integral
+            } else if (eepromBuffer.can.governor.ki_raw == 0xFF) {
+                eepromBuffer.can.governor.ki_raw = 4;
+            }
+            if (eepromBuffer.can.governor.slew_div_250 == 0xFF) {
+                eepromBuffer.can.governor.slew_div_250 = 20;
+            }
+            if (eepromBuffer.can.governor.delta_v_div_0_1 == 0xFF) {
+                eepromBuffer.can.governor.delta_v_div_0_1 = 10;
+            }
+            if (eepromBuffer.can.governor.erpm_loss_ms == 0xFF) {
+                eepromBuffer.can.governor.erpm_loss_ms = 100;
+            }
+            eepromBuffer.can.governor.crc8_atm = rpm_governor_calc_crc8_atm((const uint8_t *)&eepromBuffer.can.governor, 7);
+        }
+    }
+
     governor_erpm_loss_ms = eepromBuffer.can.governor.erpm_loss_ms;
     rpm_governor_failsafe_reset(&governor_failsafe, zero_crosses);
     // ponytail: governor requires forward-only DShot; sine-start/stall/BI must be off.
@@ -638,18 +670,30 @@ static void applyGovernorConfig(void)
         return;
     }
     if (!rpm_governor_validate_config((const uint8_t *)&eepromBuffer.can.governor)) {
-        return; // invalid CRC -> governor silently OFF (stock AM32 behavior preserved)
+        // Fallback for uninitialized / erased flash (0xFF): load production defaults
+        if (eepromBuffer.can.governor.rpm_mode_and_min == 0xFF || eepromBuffer.can.governor.rpm_max_div_100 == 0xFF) {
+            eepromBuffer.can.governor.rpm_mode_and_min = 0x80; // Governor enabled, 0 RPM base
+            eepromBuffer.can.governor.rpm_max_div_100 = 60;   // 6000 RPM max
+            eepromBuffer.can.governor.kp_raw = 60;            // speedPid.Kd = 2400
+            eepromBuffer.can.governor.ki_raw = 4;             // speedPid.Kp = 160
+            eepromBuffer.can.governor.slew_div_250 = 20;      // 5000 RPM/s
+            eepromBuffer.can.governor.delta_v_div_0_1 = 10;
+            eepromBuffer.can.governor.erpm_loss_ms = 100;     // 100 ms loss timeout
+            eepromBuffer.can.governor.crc8_atm = rpm_governor_calc_crc8_atm((const uint8_t *)&eepromBuffer.can.governor, 7);
+        } else {
+            return; // invalid CRC -> governor silently OFF (stock AM32 behavior preserved)
+        }
     }
     if ((eepromBuffer.can.governor.rpm_mode_and_min & 0x80) == 0) {
         return;
     }
-    uint8_t mn = eepromBuffer.can.governor.rpm_mode_and_min & 0x7F;
     uint8_t mx = eepromBuffer.can.governor.rpm_max_div_100;
-    if (mn < 5 || mn > 90 || mx < 10 || mx > 90 || mx <= mn) {
-        return;
+    if (mx >= 10 && mx <= 120) {
+        governor_rpm_max = (uint32_t)mx * 100u;
+    } else {
+        governor_rpm_max = 6000u;
     }
-    governor_rpm_min = (uint32_t)mn * 100u;
-    governor_rpm_max = (uint32_t)mx * 100u;
+    governor_rpm_min = 0;
     speedPid.Kp = (uint32_t)eepromBuffer.can.governor.ki_raw * 40u; // ki_raw 10 -> 400
     speedPid.Ki = 0;
     speedPid.Kd = (uint32_t)eepromBuffer.can.governor.kp_raw * 40u; // kp_raw 50 -> 2000
@@ -697,6 +741,16 @@ void loadEEpromSettings()
       eepromBuffer.auto_advance_min_rpm_div_100 = 0;
       eepromBuffer.auto_advance_max_rpm_div_100 = 0;
     }
+    if (eepromBuffer.eeprom_version < 5) {
+      eepromBuffer.can.governor.rpm_mode_and_min = 0; // Default OFF: baseline open-loop DShot
+      eepromBuffer.can.governor.rpm_max_div_100 = 60;  // 6000 RPM default ceiling
+      eepromBuffer.can.governor.kp_raw = 50;
+      eepromBuffer.can.governor.ki_raw = 10;
+      eepromBuffer.can.governor.slew_div_250 = 0;
+      eepromBuffer.can.governor.delta_v_div_0_1 = 0;
+      eepromBuffer.can.governor.erpm_loss_ms = 0;
+      eepromBuffer.can.governor.crc8_atm = rpm_governor_calc_crc8_atm((const uint8_t *)&eepromBuffer.can.governor, 7);
+    }
     if(eepromBuffer.brake_on_zero_throttle > 9){ // byte 13 held a firmware name character (0x30 or similar) before eeprom version 4
       eepromBuffer.brake_on_zero_throttle = 0;
     }
@@ -740,6 +794,12 @@ void loadEEpromSettings()
 #ifdef ONE_TWO_CELL_MAX
 		motor_kv =  motor_kv / 16;
 #endif
+    // CT-2W1 MN501 240KV exact mapping:
+    // Standard AM32 EEPROM step size of 40 KV can only encode 220 KV (byte 26 = 5) or 260 KV (byte 26 = 6).
+    // When 28 poles (MN501 24N28P) is configured, calibrate motor_kv to exact 240 KV.
+    if (eepromBuffer.motor_poles == 28 && (motor_kv == 220 || motor_kv == 260)) {
+        motor_kv = 240;
+    }
     setVolume(2);
     if (eepromBuffer.eeprom_version > 0) { // these commands weren't introduced until eeprom version 1.
 #ifdef CUSTOM_RAMP
@@ -940,7 +1000,11 @@ void update_dynamic_advance_params(void)
     }
 
     // Auto-derive modulation index points from nominal battery voltage (3.7V/cell)
+#if defined(GEN_64K_G071)
+    dyn_adv_v_nom_cv = 4500UL; // 45.00V nominal (12S)
+#else
     dyn_adv_v_nom_cv = (cell_count >= 2 && cell_count <= 14) ? ((uint32_t)cell_count * 370UL) : 2220UL;
+#endif
     uint32_t denom_nom = (eff_kv * dyn_adv_v_nom_cv) / 100UL;
     if (denom_nom > 0) {
         dyn_adv_m_start = (uint16_t)((dyn_adv_rpm_start * 10000UL) / denom_nom);
@@ -1080,8 +1144,9 @@ void PeriodElapsedCallback()
     if (!old_routine) {
         enableCompInterrupts(); // enable comp interrupt
     }
-    if (zero_crosses < 10000) {
-        zero_crosses++;
+    zero_crosses++;
+    if (zero_crosses == 0) {
+        zero_crosses = 10000;
     }
 }
 
@@ -1338,30 +1403,48 @@ void setInput()
             }
             if (use_speed_control_loop) {
                 if (drive_by_rpm) {
-                    uint32_t r_min = governor_enabled ? governor_rpm_min : MINIMUM_RPM_SPEED_CONTROL;
-                    uint32_t r_max = governor_enabled ? governor_rpm_max : MAXIMUM_RPM_SPEED_CONTROL;
+                    uint32_t r_max = (governor_enabled && governor_rpm_max > 0) ? governor_rpm_max : MAXIMUM_RPM_SPEED_CONTROL;
                     uint32_t throttle_range = 2000;
                     uint32_t throttle_in = (adjusted_input > 47) ? (uint32_t)(adjusted_input - 47) : 0;
                     if (throttle_in > throttle_range) throttle_in = throttle_range;
 
-                    // Linear Throttle-to-RPM Mapping: 0% = r_min (1000 RPM), 100% = r_max (6000 RPM)
-                    uint32_t target_rpm_val = r_min + ((throttle_in * (r_max - r_min)) / throttle_range);
+                    // Smooth Throttle-to-Thrust Curve Mapping:
+                    // 0% throttle = 0 RPM (motor off / zero-power stop)
+                    // Linearized thrust vs throttle curve with parabolic hover centering:
+                    // Centers 50% hover thrust (1250g per motor for MTOW 7.5kg / 6 VTOL tilt-rotors) at 50% throttle.
+                    // Eliminates high-throttle saturation and linearizes PX4 control allocation.
+                    uint32_t target_rpm_val = 0;
+                    if (throttle_in > 0) {
+                        uint32_t x = throttle_in * 500UL;
+                        uint32_t s = fast_int_sqrt32(x);
+                        // Parabolic hover centering term: pulls 1250g hover thrust to 50% throttle (s=725 -> 4350 RPM @ 6000 max)
+                        uint32_t boost = (18UL * throttle_in * (throttle_range - throttle_in)) / 1000000UL;
+                        uint32_t s_tot = s + boost;
+                        if (s_tot > 1000) s_tot = 1000;
+                        target_rpm_val = (r_max * s_tot) / 1000UL;
+                        // Physical sensorless BEMF stability floor for armed idle
+                        if (target_rpm_val < 500) {
+                            target_rpm_val = 500;
+                        }
+                    }
 
                     if (adjusted_input < 47) {
                         input = 0;
                         speedPid.error = 0;
                         input_override = 0;
-                        ramped_target_rpm = r_min;
+                        ramped_target_rpm = 0;
                     } else {
-                        if (!running || zero_crosses <= 20) {
-                            ramped_target_rpm = r_min;
+                        if (!running || ramped_target_rpm == 0) {
+                            // During open-loop startup ramp from stop, initialize ramped_target_rpm
+                            // smoothly without sudden step jumps
+                            ramped_target_rpm = (target_rpm_val < 600) ? target_rpm_val : 600;
                         } else {
                             // Dual-Zone Adaptive Slew Rate Limiter (User requirement: 0-25% gentle response & anti-saturation):
                             // Zone 1: 0% - 25% ga (ramped_target_rpm <= r_min + (r_max - r_min)/4, e.g. 1000 - 2250 RPM):
                             // Gentle response (~2,400 RPM/s) for high control quality, anti-saturation & zero screech.
                             // Zone 2: >25% ga (2250 - 6000 RPM):
                             // Agile fast response (~14,000 RPM/s) for VTOL flight dynamics.
-                            uint32_t low_zone_boundary = r_min + ((r_max - r_min) >> 2); // 25% ga threshold
+                            uint32_t low_zone_boundary = r_max >> 2; // 25% ga threshold
                             uint32_t max_rpm_step = 35; // Default ~14,000 RPM/s in high range
                             if (governor_slew_div_250 > 0 && governor_slew_div_250 < 35) {
                                 max_rpm_step = (uint32_t)governor_slew_div_250;
@@ -1437,7 +1520,7 @@ void setInput()
                             if (battery_voltage > 100 && motor_kv > 0 && e_com_time > 0) {
                                 uint32_t act_rpm = 60000000UL / (uint32_t)e_com_time / (eepromBuffer.motor_poles / 2);
                                 uint32_t act_duty = act_rpm * 200000UL / ((uint32_t)motor_kv * (uint32_t)battery_voltage);
-                                uint32_t low_boundary = r_min + ((r_max - r_min) >> 2);
+                                uint32_t low_boundary = r_max >> 2;
                                 uint32_t lead_allowance = 400;
                                 if (ramped_target_rpm > low_boundary && r_max > low_boundary) {
                                     lead_allowance = 400 + ((ramped_target_rpm - low_boundary) * 1150UL) / (r_max - low_boundary);
@@ -1479,10 +1562,7 @@ if (!stepper_sine && armed) {
         if (input >= 47 + (80 * eepromBuffer.use_sine_start)) {
             if (running == 0) {
                 allOff();
-                if (!old_routine) {
-                    startMotor();
-                }
-                running = 1;
+                startMotor();
                 last_duty_cycle = min_startup_duty;
             }
 
@@ -1673,6 +1753,9 @@ void tenKhzRoutine()
                             if (!servoPwm && !dshot) {
                                 eepromBuffer.rc_car_reverse = 0;
                             }
+#if defined(GEN_64K_G071)
+                            cell_count = 12;
+#endif
                         } else {
                             inputSet = 0;
                             armed_timeout_count = 0;
@@ -1977,8 +2060,10 @@ void zcfoundroutine()
     commutation_intervals[step - 1] = commutation_interval;
     bemfcounter = 0;
     bad_count = 0;
-
     zero_crosses++;
+    if (zero_crosses == 0) {
+        zero_crosses = 10000;
+    }
 #ifdef NO_POLLING_START     // changes to interrupt mode after 2 zero crosses, does not re-enter
        if (zero_crosses > 2) {
             old_routine = 0;
@@ -2121,11 +2206,28 @@ int main(void)
     enableCorePeripherals();
     loadEEpromSettings();
 #endif
+#ifdef GEN_64K_G071
+    battery_voltage = 4500; // 45.00V nominal (12S)
+    actual_current = 0;     // 0.00A clean baseline
+    // Keep cell_count = 0 initially so that arming logic at line 1727 can proceed!
+#endif
 
-    if (VERSION_MAJOR != eepromBuffer.version.major || VERSION_MINOR != eepromBuffer.version.minor || EEPROM_VERSION > eepromBuffer.eeprom_version) {
+    uint8_t gov_crc = rpm_governor_calc_crc8_atm((const uint8_t *)&eepromBuffer.can.governor, 7);
+    if (eepromBuffer.can.governor.rpm_mode_and_min == 0xFF || eepromBuffer.can.governor.rpm_max_div_100 == 0xFF) {
+        eepromBuffer.can.governor.rpm_mode_and_min = 0x80; // 0 RPM min, enabled (bit 7 = 1)
+        eepromBuffer.can.governor.rpm_max_div_100 = 60;   // 6000 RPM max
+        eepromBuffer.can.governor.kp_raw = 60;            // speedPid.Kd = 2400 (Damping)
+        eepromBuffer.can.governor.ki_raw = 4;             // speedPid.Kp = 160  (Integral)
+        eepromBuffer.can.governor.slew_div_250 = 20;      // 5000 RPM/s slew rate
+        eepromBuffer.can.governor.delta_v_div_0_1 = 10;   // 1.0 V feedforward
+        eepromBuffer.can.governor.erpm_loss_ms = 100;     // 100 ms loss timeout
+        gov_crc = rpm_governor_calc_crc8_atm((const uint8_t *)&eepromBuffer.can.governor, 7);
+    }
+    if (VERSION_MAJOR != eepromBuffer.version.major || VERSION_MINOR != eepromBuffer.version.minor || EEPROM_VERSION > eepromBuffer.eeprom_version || eepromBuffer.can.governor.crc8_atm != gov_crc) {
         eepromBuffer.version.major = VERSION_MAJOR;
         eepromBuffer.version.minor = VERSION_MINOR;
         eepromBuffer.eeprom_version = EEPROM_VERSION;
+        eepromBuffer.can.governor.crc8_atm = gov_crc;
         saveEEpromSettings();
     }
     
@@ -2493,6 +2595,16 @@ if(zero_crosses < 5){
             smoothed_raw_current = getSmoothedCurrent();
             //Actual current is in 10mA, so 1 = 10mA
             actual_current = (((smoothed_raw_current * 3300 / 65535) - CURRENT_OFFSET) * 100) / (MILLIVOLT_PER_AMP);
+#elif defined(GEN_64K_G071)
+            // CT-2W1 T-Motor Cine 80A (STM32G071): Decouple floating ADC inputs.
+            // Hardware has no on-board current shunt and no connected voltage divider.
+            // Lock clean nominal 45.00V (12S nominal) and 0.00A current.
+            battery_voltage = 4500;
+            actual_current = 0;
+            consumed_current = 0;
+            if (armed) {
+                cell_count = 12;
+            }
 #else
             battery_voltage = ((7 * battery_voltage) + ((ADC_raw_volts * 3300 / 4095 * VOLTAGE_DIVIDER) / 100)) >> 3;
             smoothed_raw_current = getSmoothedCurrent();
@@ -2510,8 +2622,8 @@ if(zero_crosses < 5){
                     current_cal_samples++;
                     if (current_cal_samples >= 64) {
                         uint32_t measured_offset = current_cal_sum >> 6;
-                        // Accept physical resting op-amp offset between 300 mV (30000) and 750 mV (75000)
-                        if (measured_offset >= 30000U && measured_offset <= 75000U) {
+                        // Accept physical resting op-amp offset up to 1500 mV (150000)
+                        if (measured_offset <= 150000U) {
                             calibrated_current_offset = measured_offset - ((uint32_t)20 * MILLIVOLT_PER_AMP);
                         }
                         current_calibrated = 1;
