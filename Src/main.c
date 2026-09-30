@@ -1439,18 +1439,19 @@ void setInput()
                             // smoothly without sudden step jumps
                             ramped_target_rpm = (target_rpm_val < 600) ? target_rpm_val : 600;
                         } else {
-                            // Dual-Zone Adaptive Slew Rate Limiter (User requirement: 0-25% gentle response & anti-saturation):
-                            // Zone 1: 0% - 25% ga (ramped_target_rpm <= r_min + (r_max - r_min)/4, e.g. 1000 - 2250 RPM):
-                            // Gentle response (~2,400 RPM/s) for high control quality, anti-saturation & zero screech.
-                            // Zone 2: >25% ga (2250 - 6000 RPM):
-                            // Agile fast response (~14,000 RPM/s) for VTOL flight dynamics.
-                            uint32_t low_zone_boundary = r_max >> 2; // 25% ga threshold
+                            // Dual-Zone Adaptive Slew Rate Limiter (User requirement: 0-15% gentle response & anti-cogging):
+                            // Zone 1: 0% - 15% ga (throttle_in <= 300, ramped_target_rpm <= low_zone_boundary):
+                            // Ultra-gentle response (~800 RPM/s, step = 2 @ 400Hz) synchronized with PX4 MPC_TKO_RAMP_T = 1.5s.
+                            // Eliminates heavy 14x10 3-blade propeller startup clunk/jerk/screech & excessive current surge.
+                            // Zone 2: >15% ga (2560 - 6500 RPM):
+                            // Agile fast response (~14,000 RPM/s, step = 35 @ 400Hz) for VTOL flight dynamics (tr = 57.8ms).
+                            uint32_t low_zone_boundary = (r_max * 394UL) / 1000UL; // ~2,560 RPM at 15% throttle
                             uint32_t max_rpm_step = 35; // Default ~14,000 RPM/s in high range
                             if (governor_slew_div_250 > 0 && governor_slew_div_250 < 35) {
                                 max_rpm_step = (uint32_t)governor_slew_div_250;
                             }
-                            if (ramped_target_rpm <= low_zone_boundary) {
-                                max_rpm_step = 6; // 6 * 400Hz = 2400 RPM/s (gentle anti-saturation in 0-25% zone)
+                            if (throttle_in <= 300 || ramped_target_rpm <= low_zone_boundary) {
+                                max_rpm_step = 2; // 2 * 400Hz = 800 RPM/s (gentle soft spool-up in 0-15% zone)
                             }
                             if (ramped_target_rpm < target_rpm_val) {
                                 ramped_target_rpm += max_rpm_step;
