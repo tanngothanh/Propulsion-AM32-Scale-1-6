@@ -698,17 +698,19 @@ static void applyGovernorConfig(void)
     speedPid.Ki = 0;
     speedPid.Kd = (uint32_t)eepromBuffer.can.governor.kp_raw * 40u; // kp_raw 50 -> 2000
     speedPid.integral_limit = 5000000;
-    uint32_t pwm_f = eepromBuffer.pwm_frequency;
-    if (pwm_f < 8 || pwm_f > 144) {
-        pwm_f = 24;
+    // DEAD_TIME is already hardware-compensated at TIM1 CCR (line 1915).
+    // Use gentle breakaway duty (120/2000 = 6.0% duty on 12S 49V) to eliminate startup magnetic hammer.
+    uint16_t gentle_breakaway = 120U;
+    if (eepromBuffer.startup_power >= 50 && eepromBuffer.startup_power <= 150) {
+        gentle_breakaway = (uint16_t)eepromBuffer.startup_power + 20U;
     }
-    uint16_t freq_breakaway = (uint16_t)((pwm_f * 285U) / 24U); // Constant 5.76us breakaway pulse: 285@24k, 380@32k, 570@48k
-    if (min_startup_duty < freq_breakaway) {
-        min_startup_duty = freq_breakaway; // normalized breakaway impulse for 18S24P motors
+    if (gentle_breakaway < 100U) gentle_breakaway = 100U;
+    if (gentle_breakaway > 180U) gentle_breakaway = 180U;
+    min_startup_duty = gentle_breakaway;
+    if (minimum_duty_cycle < 20U || minimum_duty_cycle > 60U) {
+        minimum_duty_cycle = 40U;
     }
-    if (startup_max_duty_cycle < min_startup_duty + 200) {
-        startup_max_duty_cycle = min_startup_duty + 200;
-    }
+    startup_max_duty_cycle = min_startup_duty + 160U;
     speedPid.output_limit = 50000;
     governor_slew_div_250 = eepromBuffer.can.governor.slew_div_250;
     governor_erpm_loss_ms = eepromBuffer.can.governor.erpm_loss_ms;
@@ -1001,7 +1003,7 @@ void update_dynamic_advance_params(void)
 
     // Auto-derive modulation index points from nominal battery voltage (3.7V/cell)
 #if defined(GEN_64K_G071)
-    dyn_adv_v_nom_cv = 4500UL; // 45.00V nominal (12S)
+    dyn_adv_v_nom_cv = 4900UL; // 49.00V nominal (12S 48V-50V midpoint)
 #else
     dyn_adv_v_nom_cv = (cell_count >= 2 && cell_count <= 14) ? ((uint32_t)cell_count * 370UL) : 2220UL;
 #endif
@@ -1104,7 +1106,7 @@ void commutate()
     __enable_irq();
     changeCompInput();
 #ifndef NO_POLLING_START
-    uint32_t polling_revert = governor_enabled ? 2200 : (polling_mode_changeover + 500);
+    uint32_t polling_revert = governor_enabled ? 4200 : (polling_mode_changeover + 500);
 	if (average_interval > polling_revert) {
       old_routine = 1;
    }
@@ -1428,30 +1430,48 @@ void setInput()
                         }
                     }
 
-                    if (adjusted_input < 47) {
+                    if (adjusted_input <= 47 || throttle_in == 0) {
                         input = 0;
                         speedPid.error = 0;
+                        speedPid.integral = 0;
+                        speedPid.last_error = 0;
                         input_override = 0;
+                        last_ff_override = 0;
                         ramped_target_rpm = 0;
                     } else {
-                        if (!running || ramped_target_rpm == 0) {
-                            // During open-loop startup ramp from stop, initialize ramped_target_rpm
-                            // smoothly without sudden step jumps
-                            ramped_target_rpm = (target_rpm_val < 600) ? target_rpm_val : 600;
-                        } else {
-                            // Dual-Zone Adaptive Slew Rate Limiter (User requirement: 0-15% gentle response & anti-cogging):
-                            // Zone 1: 0% - 15% ga (throttle_in <= 300, ramped_target_rpm <= low_zone_boundary):
-                            // Ultra-gentle response (~800 RPM/s, step = 2 @ 400Hz) synchronized with PX4 MPC_TKO_RAMP_T = 1.5s.
-                            // Eliminates heavy 14x10 3-blade propeller startup clunk/jerk/screech & excessive current surge.
-                            // Zone 2: >15% ga (2560 - 6500 RPM):
-                            // Agile fast response (~14,000 RPM/s, step = 35 @ 400Hz) for VTOL flight dynamics (tr = 57.8ms).
-                            uint32_t low_zone_boundary = (r_max * 394UL) / 1000UL; // ~2,560 RPM at 15% throttle
-                            uint32_t max_rpm_step = 35; // Default ~14,000 RPM/s in high range
-                            if (governor_slew_div_250 > 0 && governor_slew_div_250 < 35) {
-                                max_rpm_step = (uint32_t)governor_slew_div_250;
+                        // Mandatory 0-1% Smooth Open-Loop Startup Trajectory & Unified >1% High-Speed Closed-Loop Zone:
+                        // 1. Open-Loop Zone activates when throttle <= 1% (throttle_in <= 20, DShot 48..67)
+                        //    OR during startup from stop (!running || zero_crosses <= 84 || old_routine), even when PX4 Arms at DSHOT_MIN = 2%..5%.
+                        // 2. Unified High-Speed Closed-Loop Zone (>1% to 100% throttle, DShot 68..2047) uses a single
+                        //    governor_rpm_max parameter (r_max = 6500 RPM) and full slew rate across the entire range.
+                        bool in_openloop_zone = governor_enabled
+                            ? ((throttle_in <= 20U) || (!running) || (zero_crosses <= 84U) || (old_routine != 0))
+                            : ((!running) || (zero_crosses <= 20U));
+
+                        if (in_openloop_zone) {
+                            uint32_t openloop_cap_rpm = r_max / 10U; // 650 RPM at 1.0% boundary (for r_max = 6500)
+                            if (openloop_cap_rpm < 500U) openloop_cap_rpm = 500U;
+                            if (throttle_in <= 20U && target_rpm_val < openloop_cap_rpm) {
+                                openloop_cap_rpm = target_rpm_val;
                             }
-                            if (throttle_in <= 300 || ramped_target_rpm <= low_zone_boundary) {
-                                max_rpm_step = 2; // 2 * 400Hz = 800 RPM/s (gentle soft spool-up in 0-15% zone)
+                            uint32_t seed_rpm = (openloop_cap_rpm < 600U) ? openloop_cap_rpm : 600U;
+                            if (running && zero_crosses > 10U && e_com_time > 0) {
+                                uint32_t poles = (eepromBuffer.motor_poles >= 2) ? (uint32_t)eepromBuffer.motor_poles : 14U;
+                                uint32_t act_rpm = 60000000UL / (uint32_t)e_com_time / (poles / 2U);
+                                if (act_rpm < 500U) act_rpm = 500U;
+                                if (act_rpm > openloop_cap_rpm) act_rpm = openloop_cap_rpm;
+                                seed_rpm = act_rpm;
+                            }
+                            ramped_target_rpm = seed_rpm;
+                        } else {
+                            // Unified Single-Zone High-Speed Slew Rate Limiter (1% - 100% throttle):
+                            // Eliminates 15% zone split to guarantee instant Hover + Yaw recovery at DSHOT_MIN = 2% (923 RPM).
+                            uint32_t max_rpm_step = 35U; // Default ~14,000 RPM/s
+                            if (governor_slew_div_250 > 0 && governor_slew_div_250 <= 100U) {
+                                max_rpm_step = (uint32_t)governor_slew_div_250; // 28 * 400Hz = 11,200 RPM/s
+                            }
+                            if (ramped_target_rpm == 0) {
+                                ramped_target_rpm = r_max / 10U;
                             }
                             if (ramped_target_rpm < target_rpm_val) {
                                 ramped_target_rpm += max_rpm_step;
@@ -1482,27 +1502,31 @@ void setInput()
                             if (ff_input > 2047) ff_input = 2047;
                         }
 
-                        uint32_t pwm_f = eepromBuffer.pwm_frequency;
-                        if (pwm_f < 8 || pwm_f > 144) {
-                            pwm_f = 24;
-                        }
-                        uint16_t freq_breakaway = (uint16_t)((pwm_f * 285U) / 24U);
-
-                        if (!running || zero_crosses <= 20) {
+                        if (in_openloop_zone) {
                             int32_t start_input = adjusted_input;
                             if (governor_enabled) {
-                                if (start_input < freq_breakaway) {
-                                    start_input = freq_breakaway;
+                                // Smooth Open-Loop 0% -> 1% Startup Envelope:
+                                // Sweeps effective open-loop throttle from 0 to 20 (0% -> 1%) across the first 84 zero-crosses
+                                // (1 full mechanical revolution for 28-pole motor), even if armed at 2%..5% DSHOT_MIN.
+                                uint32_t zc_prog = (zero_crosses < 84U) ? zero_crosses : 84U;
+                                uint32_t ramp_thr = (zc_prog * 20UL) / 84UL;
+                                uint32_t eff_openloop_throttle = (throttle_in < ramp_thr) ? throttle_in : ramp_thr;
+                                uint32_t start_duty = (uint32_t)min_startup_duty + (eff_openloop_throttle * 2U);
+                                if (zero_crosses > 84U && old_routine != 0) {
+                                    start_duty += (zero_crosses - 84U) >> 2;
                                 }
-                                // Root Cause 1 Fix: Clamp start_input strictly to gentle breakaway power.
-                                // NEVER override with ff_input while stationary!
-                                if (start_input > (freq_breakaway + 30)) {
-                                    start_input = freq_breakaway + 30;
+                                if (start_duty > (uint32_t)startup_max_duty_cycle) {
+                                    start_duty = (uint32_t)startup_max_duty_cycle;
                                 }
+                                start_input = 47 + (int32_t)start_duty;
                             }
                             input = (uint16_t)start_input;
+                            // C0 Bumpless Handoff: anchor last_ff_override to ff_input * 10000 so that
+                            // pid_correction = (start_input - ff_input) * 10000 on the first closed-loop tick (zero step jump!)
                             input_override = (int32_t)start_input * 10000;
-                            last_ff_override = input_override;
+                            last_ff_override = ff_input * 10000;
+                            speedPid.integral = 0;
+                            speedPid.last_error = (int32_t)e_com_time - (int32_t)target_e_com_time;
                         } else {
                             // Feedforward base + accumulated PID correction
                             int32_t ff_override = ff_input * 10000;
@@ -1513,15 +1537,11 @@ void setInput()
                             __set_PRIMASK(primask);
                             last_ff_override = ff_override;
 
-                            // Progressive Dynamic Lead Clamp:
-                            // Zone 1 (0-25% throttle, <= low_boundary): +400 counts lead prevents startup saturation/screech/jerk.
-                            // Zone 2 (>25% throttle): progressive lead expands smoothly up to +1550 counts (full duty headroom at 6000 RPM).
-                            // This allows sufficient voltage to reach 6000 RPM under heavy propeller load while strictly preventing
-                            // low-speed voltage slam and current spikes!
+                            // Progressive Dynamic Lead Clamp (unified from 1% boundary = r_max / 10):
                             if (battery_voltage > 100 && motor_kv > 0 && e_com_time > 0) {
                                 uint32_t act_rpm = 60000000UL / (uint32_t)e_com_time / (eepromBuffer.motor_poles / 2);
                                 uint32_t act_duty = act_rpm * 200000UL / ((uint32_t)motor_kv * (uint32_t)battery_voltage);
-                                uint32_t low_boundary = r_max >> 2;
+                                uint32_t low_boundary = r_max / 10;
                                 uint32_t lead_allowance = 400;
                                 if (ramped_target_rpm > low_boundary && r_max > low_boundary) {
                                     lead_allowance = 400 + ((ramped_target_rpm - low_boundary) * 1150UL) / (r_max - low_boundary);
@@ -1564,7 +1584,7 @@ if (!stepper_sine && armed) {
             if (running == 0) {
                 allOff();
                 startMotor();
-                last_duty_cycle = min_startup_duty;
+                last_duty_cycle = governor_enabled ? minimum_duty_cycle : min_startup_duty;
             }
 
             if (eepromBuffer.use_sine_start) {
@@ -1834,7 +1854,10 @@ void tenKhzRoutine()
                     stall_protection_adjust = 0;
                 }
             }
-            if (use_speed_control_loop && running && (zero_crosses > 20)) {
+            bool cl_pid_active = governor_enabled
+                ? (running && (zero_crosses > 84) && !old_routine && (adjusted_input > 67))
+                : (running && (zero_crosses > 20));
+            if (use_speed_control_loop && cl_pid_active) {
                 int32_t pid_out = doPidCalculations(&speedPid, e_com_time, target_e_com_time);
                 int32_t current_ceiling = (int32_t)eepromBuffer.limits.current * 2 * 100; // e.g. 24A = 2400
                 if (current_ceiling == 0 || current_ceiling > 5000) current_ceiling = 2400;
@@ -1863,7 +1886,7 @@ void tenKhzRoutine()
                 if (zero_crosses < 100) {
                     speedPid.integral = 0;
                 }
-            } else if (use_speed_control_loop && running && (zero_crosses <= 20)) {
+            } else if (use_speed_control_loop && running) {
                 if (!governor_enabled) {
                     input_override = (int32_t)adjusted_input * 10000;
                     last_ff_override = input_override;
@@ -2072,7 +2095,7 @@ void zcfoundroutine()
         }
 #else
     if (governor_enabled || eepromBuffer.stall_protection || eepromBuffer.rc_car_reverse) {
-        uint32_t changeover_thresh = governor_enabled ? 1500 : 2000;
+        uint32_t changeover_thresh = governor_enabled ? 3500 : 2000;
         if (zero_crosses >= 50 && commutation_interval <= changeover_thresh) {
             old_routine = 0;
             enableCompInterrupts(); // enable interrupt
@@ -2208,7 +2231,7 @@ int main(void)
     loadEEpromSettings();
 #endif
 #ifdef GEN_64K_G071
-    battery_voltage = 4500; // 45.00V nominal (12S)
+    battery_voltage = 4900; // 49.00V nominal (12S 48V-50V midpoint)
     actual_current = 0;     // 0.00A clean baseline
     // Keep cell_count = 0 initially so that arming logic at line 1727 can proceed!
 #endif
@@ -2599,8 +2622,8 @@ if(zero_crosses < 5){
 #elif defined(GEN_64K_G071)
             // CT-2W1 T-Motor Cine 80A (STM32G071): Decouple floating ADC inputs.
             // Hardware has no on-board current shunt and no connected voltage divider.
-            // Lock clean nominal 45.00V (12S nominal) and 0.00A current.
-            battery_voltage = 4500;
+            // Lock clean nominal 49.00V (12S 48V-50V midpoint) and 0.00A current.
+            battery_voltage = 4900;
             actual_current = 0;
             consumed_current = 0;
             if (armed) {
